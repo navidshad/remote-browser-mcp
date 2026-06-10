@@ -13,6 +13,7 @@
     "start": "node dist/index.js",
     "smoke": "tsx src/smoke-test.ts",
     "live": "tsx src/live-test.ts",
+    "task": "tsx src/task-report.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

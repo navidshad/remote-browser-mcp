@@ -7,3 +7,6 @@ dist/
 
 # Playwright MCP runtime snapshot cache
 .playwright-mcp/
+
+# Generated agent task reports
+out/
