@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.js.map
+*.d.ts.map
+.DS_Store
+
+# Playwright MCP runtime snapshot cache
+.playwright-mcp/
