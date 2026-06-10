@@ -21,10 +21,6 @@ WORKDIR /app
 COPY --from=builder /build/node_modules ./node_modules
 COPY --from=builder /build/packages/agent/dist ./dist
 
-# The agent reads these at startup (override at run time)
-ENV DAEMON_URL=""
-ENV PLAYWRIGHT_URL=""
-ENV ANTHROPIC_API_KEY=""
-ENV MODEL="claude-opus-4-8"
-
+# Config is supplied at run time (docker-compose env / -e flags), not baked in.
+# LLM_PROVIDER defaults to gemini in the app; MODEL defaults per provider.
 CMD ["node", "dist/index.js"]

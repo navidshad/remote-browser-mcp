@@ -32,7 +32,7 @@ The agent always reaches the browser **over the network**, never on localhost �
 | Path | What it is |
 |---|---|
 | [`packages/daemon`](packages/daemon) | The MCP sidecar we build. Exposes `check_local_status`; fires a macOS notification (terminal print elsewhere) when a session starts. Never sits in the browser traffic path. |
-| [`packages/agent`](packages/agent) | The terminal agent (mock of the AWS-VM client). Connects to the daemon + Playwright MCP, runs an Anthropic tool-use loop. Includes a no-API-key `smoke` test. |
+| [`packages/agent`](packages/agent) | The terminal agent (mock of the AWS-VM client). Connects to the daemon + Playwright MCP and runs a tool-use loop. The LLM brain is pluggable ([`src/llm`](packages/agent/src/llm)) — **Gemini** by default, Anthropic optional. Includes a no-API-key `smoke` test. |
 | [`docker/`](docker) | `Dockerfile.agent` — the agent as a container (mock AWS VM). |
 | [`scripts/start-local.sh`](scripts/start-local.sh) | Brings up all host services + Cloudflare tunnels. |
 
@@ -42,7 +42,7 @@ The agent always reaches the browser **over the network**, never on localhost �
 - **Google Chrome**
 - **Docker** (for the M2 mock-VM flow)
 - **cloudflared** — `brew install cloudflared` (for the tunnel; M2+)
-- **An Anthropic API key** — `export ANTHROPIC_API_KEY=sk-ant-...`
+- **A Gemini API key** — `export GEMINI_API_KEY=...` (the default LLM provider). To use Claude instead, set `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY=...`.
 
 ## Quick start
 
@@ -94,14 +94,26 @@ Browser drive:
 ✓ All checks passed.
 ```
 
-Then run the agent interactively:
+Then drive the browser with the LLM. The `live` script runs one task end-to-end
+(handy for a quick check); `start` is the interactive REPL:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... \
+# One-shot live task (uses GEMINI_API_KEY from your environment / .env)
+GEMINI_API_KEY=... \
+DAEMON_URL=http://localhost:3001/mcp PLAYWRIGHT_URL=http://localhost:3000 \
+TASK="Open a new tab, go to example.com, and tell me the page title." \
+npm run live --workspace=packages/agent
+
+# Interactive REPL
+GEMINI_API_KEY=... \
 DAEMON_URL=http://localhost:3001/mcp \
 PLAYWRIGHT_URL=http://localhost:3000 \
 npm run start --workspace=packages/agent
 ```
+
+The agent runs a tool-use loop: it calls `check_local_status`, opens a new tab,
+navigates, and reports back. Switch the brain with `LLM_PROVIDER=anthropic` (and
+`ANTHROPIC_API_KEY`); override the model with `MODEL=...`.
 
 ### M2 — Tunnel + Docker mock VM (the real NAT path)
 
@@ -117,7 +129,7 @@ cp .env.example .env
 # Edit .env:
 #   PLAYWRIGHT_URL=https://<playwright>.trycloudflare.com
 #   DAEMON_URL=https://<daemon>.trycloudflare.com/mcp
-#   ANTHROPIC_API_KEY=sk-ant-...
+#   GEMINI_API_KEY=...
 ```
 
 ```bash
@@ -150,6 +162,12 @@ Because the Chrome window is on **your** screen, you can grab the mouse/keyboard
 - Channel mode opens **no** network debug port; the remote-debugging opt-in is per-instance and local-only.
 - The daemon never logs page content or screenshots.
 - **`--allowed-hosts`:** Playwright MCP rejects requests whose `Host` header isn't its bound host (DNS-rebinding protection), which a tunnel trips with a `403`. `start-local.sh` passes `--allowed-hosts '*'` so the changing `trycloudflare.com` URL is accepted, relying on the authenticated tunnel as the security boundary. Pin a specific host with `PLAYWRIGHT_ALLOWED_HOSTS=...` once you have a stable tunnel URL.
+
+## Troubleshooting
+
+- **`Browser context management is not supported`** (from a browser tool) — Playwright is attached to Chrome over CDP and the browser has no usable page/window (e.g. its last tab was closed, leaving 0 page targets). Make sure Chrome has at least one normal window open, then retry. With **channel mode** against your everyday Chrome this is rare (you always have windows open); it mostly bites a minimal dedicated debug profile. A clean reset: close the debug Chrome, delete its `--user-data-dir`, relaunch with a real URL, and restart Playwright MCP.
+- **`check_local_status` says debugging isn't accessible** — enable it at `chrome://inspect/#remote-debugging` (channel mode) or launch Chrome with `--remote-debugging-port=9222` (CDP-port mode).
+- **`403` from Playwright MCP through the tunnel** — see the `--allowed-hosts` note above.
 
 ## Make targets
 

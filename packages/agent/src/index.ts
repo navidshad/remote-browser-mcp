@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 import readline from "readline";
-import Anthropic from "@anthropic-ai/sdk";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import type { Tool } from "@anthropic-ai/sdk/resources/messages.js";
+import { selectProvider, type McpToolDef } from "./llm/index.js";
 
 // ── Config from env ──────────────────────────────────────────────────────────
 const DAEMON_URL = process.env.DAEMON_URL ?? "http://localhost:3001/mcp";
 const PLAYWRIGHT_URL = process.env.PLAYWRIGHT_URL ?? "http://localhost:3000";
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.MODEL ?? "claude-opus-4-8";
+const provider = selectProvider(process.env.LLM_PROVIDER || undefined);
+// `||` not `??`: an empty MODEL="" (e.g. from an unset compose var) falls back too.
+const MODEL = process.env.MODEL || provider.defaultModel;
 
 // ── MCP result helpers ───────────────────────────────────────────────────────
 // The SDK types callTool's return with a string index signature, which widens
@@ -60,13 +60,14 @@ async function main() {
   console.log("║      Remote Browser MCP Agent        ║");
   console.log("╚══════════════════════════════════════╝");
   console.log();
-  console.log(`Daemon   : ${DAEMON_URL}`);
+  console.log(`Daemon    : ${DAEMON_URL}`);
   console.log(`Playwright: ${PLAYWRIGHT_URL}`);
-  console.log(`Model    : ${MODEL}`);
+  console.log(`Provider  : ${provider.name}`);
+  console.log(`Model     : ${MODEL}`);
   console.log();
 
-  if (!ANTHROPIC_API_KEY) {
-    console.error("Error: ANTHROPIC_API_KEY is not set.");
+  if (!provider.isConfigured()) {
+    console.error(`Error: ${provider.missingKeyMessage()}`);
     process.exit(1);
   }
 
@@ -108,18 +109,19 @@ async function main() {
     console.log(`Status check failed: ${err}`);
   }
 
-  // Gather tools from connected servers
-  const buildToolList = async (): Promise<{ tools: Tool[]; sources: Map<string, "daemon" | "playwright"> }> => {
-    const tools: Tool[] = [];
-    const sources = new Map<string, "daemon" | "playwright">();
+  // Maps each tool name to the server that owns it. Persistent (not rebuilt fresh
+  // each call) so callMcpTool always sees the latest set — including tools from a
+  // Playwright server that reconnected mid-session.
+  const sources = new Map<string, "daemon" | "playwright">();
+
+  // Gather tools from connected servers in provider-neutral form.
+  const buildToolList = async (): Promise<McpToolDef[]> => {
+    const tools: McpToolDef[] = [];
+    sources.clear();
 
     const daemonTools = await daemon.listTools();
     for (const t of daemonTools.tools) {
-      tools.push({
-        name: t.name,
-        description: t.description ?? "",
-        input_schema: t.inputSchema as Tool["input_schema"],
-      });
+      tools.push({ name: t.name, description: t.description ?? "", inputSchema: t.inputSchema });
       sources.set(t.name, "daemon");
     }
 
@@ -137,11 +139,7 @@ async function main() {
       try {
         const pwTools = await playwright.listTools();
         for (const t of pwTools.tools) {
-          tools.push({
-            name: t.name,
-            description: t.description ?? "",
-            input_schema: t.inputSchema as Tool["input_schema"],
-          });
+          tools.push({ name: t.name, description: t.description ?? "", inputSchema: t.inputSchema });
           sources.set(t.name, "playwright");
         }
       } catch {
@@ -150,30 +148,26 @@ async function main() {
       }
     }
 
-    return { tools, sources };
+    return tools;
   };
 
-  const { tools, sources } = await buildToolList();
+  const initialTools = await buildToolList();
   const daemonCount = [...sources.values()].filter((s) => s === "daemon").length;
   const pwCount = [...sources.values()].filter((s) => s === "playwright").length;
-  console.log(`\nTools available: ${tools.length} (${daemonCount} daemon + ${pwCount} playwright)\n`);
+  console.log(`\nTools available: ${initialTools.length} (${daemonCount} daemon + ${pwCount} playwright)\n`);
 
-  // Anthropic client
-  const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-
-  // Session state
+  // Session state — fire the notification once, before the first browser tool call.
   let sessionNotified = false;
 
-  const callMcpTool = async (name: string, input: unknown): Promise<string> => {
+  const callMcpTool = async (name: string, args: Record<string, unknown>): Promise<string> => {
     const source = sources.get(name);
 
     if (source === "daemon") {
-      const res = await daemon.callTool({ name, arguments: input as Record<string, unknown> });
+      const res = await daemon.callTool({ name, arguments: args });
       return firstText(res);
     }
 
     if (source === "playwright") {
-      // Notify once before the first browser tool call
       if (!sessionNotified) {
         sessionNotified = true;
         await daemon
@@ -191,9 +185,8 @@ async function main() {
         }
       }
 
-      const res = await playwright.callTool({ name, arguments: input as Record<string, unknown> });
+      const res = await playwright.callTool({ name, arguments: args });
       const parts = getContent(res);
-      // Return text if present; for images return a placeholder
       const text = parts.find((p) => p.type === "text")?.text;
       if (text) return text;
       const img = parts.find((p) => p.type === "image");
@@ -204,77 +197,57 @@ async function main() {
     throw new Error(`Unknown tool: ${name}`);
   };
 
-  // ── Chat loop ─────────────────────────────────────────────────────────────
-  const messages: Anthropic.MessageParam[] = [];
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: "> ",
-  });
-
+  // ── LLM session ─────────────────────────────────────────────────────────────
   const SYSTEM_PROMPT =
     "You are a browser automation agent with access to a real Chrome browser on the user's local machine. " +
     "Before using any browser tools, call check_local_status (with notify=true on the first call) to confirm the machine is online and Chrome is ready. " +
     "When navigating, always open a new tab rather than reusing existing ones. " +
     "Be concise in your responses. Describe what you did and what you found.";
 
-  const handleTurn = async (input: string): Promise<void> => {
-    messages.push({ role: "user", content: input });
-    const currentTools = (await buildToolList()).tools;
+  const session = provider.createSession({
+    systemPrompt: SYSTEM_PROMPT,
+    model: MODEL,
+    listTools: buildToolList,
+    callTool: callMcpTool,
+  });
 
-    let response = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 8192,
-      system: SYSTEM_PROMPT,
-      messages,
-      tools: currentTools,
-    });
+  // ── Chat loop ─────────────────────────────────────────────────────────────
+  // A line queue (rather than `for await (const line of rl)`) so input is handled
+  // deterministically whether it's an interactive TTY or piped/buffered stdin —
+  // readline's async iterator can drop lines emitted before iteration begins.
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "> ",
+  });
 
-    // Agentic tool-use loop
-    while (response.stop_reason === "tool_use") {
-      const toolUses = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
-      const results: Anthropic.ToolResultBlockParam[] = [];
+  const queue: string[] = [];
+  let closed = false;
+  let wake: (() => void) | null = null;
+  rl.on("line", (l) => {
+    queue.push(l);
+    wake?.();
+    wake = null;
+  });
+  rl.on("close", () => {
+    closed = true;
+    wake?.();
+    wake = null;
+  });
 
-      for (const tu of toolUses) {
-        process.stdout.write(`  [${tu.name}] `);
-        try {
-          const out = await callMcpTool(tu.name, tu.input);
-          process.stdout.write("✓\n");
-          results.push({ type: "tool_result", tool_use_id: tu.id, content: out });
-        } catch (err) {
-          process.stdout.write(`✗ ${err}\n`);
-          results.push({
-            type: "tool_result",
-            tool_use_id: tu.id,
-            content: `Error: ${err}`,
-            is_error: true,
-          });
-        }
-      }
-
-      messages.push({ role: "assistant", content: response.content });
-      messages.push({ role: "user", content: results });
-
-      response = await anthropic.messages.create({
-        model: MODEL,
-        max_tokens: 8192,
-        system: SYSTEM_PROMPT,
-        messages,
-        tools: currentTools,
+  const nextLine = async (): Promise<string | null> => {
+    while (queue.length === 0 && !closed) {
+      await new Promise<void>((resolve) => {
+        wake = resolve;
       });
     }
-
-    const textBlocks = response.content.filter((b): b is Anthropic.TextBlock => b.type === "text");
-    if (textBlocks.length > 0) {
-      console.log("\n" + textBlocks.map((b) => b.text).join("\n"));
-    }
-    messages.push({ role: "assistant", content: response.content });
+    return queue.shift() ?? null;
   };
 
   console.log("Type a command (or /status, /tools, /quit):\n");
   rl.prompt();
 
-  for await (const line of rl) {
+  for (let line = await nextLine(); line !== null; line = await nextLine()) {
     const input = line.trim();
 
     if (!input) {
@@ -294,7 +267,7 @@ async function main() {
     }
 
     if (input === "/tools") {
-      const { tools: t } = await buildToolList();
+      const t = await buildToolList();
       console.log(`\n${t.length} tools:`);
       for (const tool of t) console.log(`  • ${tool.name}`);
       console.log();
@@ -303,7 +276,8 @@ async function main() {
     }
 
     try {
-      await handleTurn(input);
+      const text = await session.send(input);
+      if (text) console.log("\n" + text);
     } catch (err) {
       console.error(`\nError: ${err}`);
     }

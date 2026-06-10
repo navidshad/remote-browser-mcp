@@ -8,8 +8,11 @@ services:
       # Set these in .env or export before running docker-compose up
       - DAEMON_URL=${DAEMON_URL:?Set DAEMON_URL to the tunnel URL of the daemon, e.g. https://xxx.trycloudflare.com/mcp}
       - PLAYWRIGHT_URL=${PLAYWRIGHT_URL:?Set PLAYWRIGHT_URL to the tunnel URL of playwright-mcp, e.g. https://yyy.trycloudflare.com}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY}
-      - MODEL=${MODEL:-claude-opus-4-8}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - MODEL=${MODEL:-}
     stdin_open: true
     tty: true
     # No host networking — agent MUST reach the browser only via the tunnel URLs,
