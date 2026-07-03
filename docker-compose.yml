@@ -1,0 +1,20 @@
+services:
+  # Mock AWS VM — the agent that will drive the remote browser
+  agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+    environment:
+      # Set these in .env or export before running docker-compose up
+      - DAEMON_URL=${DAEMON_URL:?Set DAEMON_URL to the tunnel URL of the daemon, e.g. https://xxx.trycloudflare.com/mcp}
+      - PLAYWRIGHT_URL=${PLAYWRIGHT_URL:?Set PLAYWRIGHT_URL to the tunnel URL of playwright-mcp, e.g. https://yyy.trycloudflare.com}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - MODEL=${MODEL:-}
+    stdin_open: true
+    tty: true
+    # No host networking — agent MUST reach the browser only via the tunnel URLs,
+    # exactly as it will from a real AWS VM. Never use host.docker.internal here.
+    network_mode: bridge

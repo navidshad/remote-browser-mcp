@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Remote Browser Agent (Aso Dara)",
+  "version": "0.1.0",
+  "description": "Connects this Chrome profile to the remote agent on the VM and lets it drive a tab via chrome.debugger. Install ONLY in the Aso Dara profile.",
+  "background": {
+    "service_worker": "src/sw.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Remote Browser Agent"
+  },
+  "permissions": ["debugger", "tabs", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"]
+}

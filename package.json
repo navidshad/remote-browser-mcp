@@ -1,0 +1,16 @@
+{
+  "name": "remote-browser-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev:daemon": "npm run dev --workspace=packages/daemon",
+    "dev:agent": "npm run dev --workspace=packages/agent",
+    "start:daemon": "npm run start --workspace=packages/daemon",
+    "start:agent": "npm run start --workspace=packages/agent",
+    "install:all": "npm install --workspaces"
+  }
+}
