@@ -99,6 +99,11 @@ export class McpBridge {
     if (this.playwright) {
       try {
         for (const t of (await this.playwright.listTools()).tools) {
+          // Dedupe by name: when DAEMON_URL and the browser URL point at the
+          // same bridge endpoint (the new single-endpoint setup), check_local_status
+          // shows up in both lists — keep the first (daemon) source and skip dupes
+          // so the LLM never receives two tools with the same name.
+          if (this.sources.has(t.name)) continue;
           tools.push({ name: t.name, description: t.description ?? "", inputSchema: t.inputSchema });
           this.sources.set(t.name, "playwright");
         }
