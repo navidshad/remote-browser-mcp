@@ -11,6 +11,7 @@
     "dev:agent": "npm run dev --workspace=packages/agent",
     "start:daemon": "npm run start --workspace=packages/daemon",
     "start:agent": "npm run start --workspace=packages/agent",
+    "test:mock": "npm run build --workspace=packages/bridge-server && node scripts/mock-harness.mjs",
     "install:all": "npm install --workspaces"
   }
 }

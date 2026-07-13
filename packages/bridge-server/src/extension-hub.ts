@@ -64,11 +64,33 @@ export class ExtensionHub {
     url: null,
     sessions: [],
   };
-  /** MCP sessions the bridge has opened (so a reconnecting extension can be
-   *  told to re-establish them). Keyed by Mcp-Session-Id. */
-  private openSessions = new Set<string>();
+  /** MCP sessions the bridge has opened → last-activity timestamp. Used to
+   *  re-announce sessions to a reconnecting extension and to reap sessions whose
+   *  agent died without sending a DELETE (a dropped SSE stream isn't observable
+   *  server-side, so idle-timeout is the backstop). Keyed by Mcp-Session-Id. */
+  private openSessions = new Map<string, number>();
+  private reaper: NodeJS.Timeout | null = null;
 
-  constructor(private readonly token: string) {}
+  constructor(
+    private readonly token: string,
+    /** Reap a session after this many ms with no activity (0 disables). */
+    private readonly sessionIdleMs = 30 * 60_000
+  ) {
+    if (sessionIdleMs > 0) {
+      this.reaper = setInterval(() => this.reapIdleSessions(), Math.min(sessionIdleMs, 60_000));
+      this.reaper.unref?.();
+    }
+  }
+
+  private reapIdleSessions(): void {
+    const now = Date.now();
+    for (const [sid, last] of this.openSessions) {
+      if (now - last > this.sessionIdleMs) {
+        console.log(`[hub] reaping idle session ${sid} (no activity for ${Math.round((now - last) / 1000)}s)`);
+        this.closeSession(sid); // tears down its tabs in the extension
+      }
+    }
+  }
 
   /** How many tabs a given MCP session currently owns (from the last status). */
   tabCountFor(sessionId: string | undefined): number {
@@ -79,7 +101,7 @@ export class ExtensionHub {
   /** Tell the extension a new MCP session exists. Best-effort (no-op if offline;
    *  the session is also created lazily on its first command). */
   openSession(sessionId: string): void {
-    this.openSessions.add(sessionId);
+    this.openSessions.set(sessionId, Date.now());
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ t: "session_open", sessionId }));
     }
@@ -170,7 +192,7 @@ export class ExtensionHub {
     this.status.lastHeartbeatAt = Date.now();
     // A fresh extension has no sessions; re-announce the ones we know about so
     // status reflects them (their tabs, if any, are gone with the old browser).
-    for (const sid of this.openSessions) {
+    for (const sid of this.openSessions.keys()) {
       try {
         ws.send(JSON.stringify({ t: "session_open", sessionId: sid }));
       } catch {
@@ -252,6 +274,7 @@ export class ExtensionHub {
     timeoutMs: number,
     sessionId?: string
   ): Promise<ToolResult> {
+    if (sessionId) this.openSessions.set(sessionId, Date.now()); // mark activity (also revives a reaped id)
     const ws = this.socket;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return notConnectedResult();

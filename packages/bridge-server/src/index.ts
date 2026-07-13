@@ -32,7 +32,11 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-const hub = new ExtensionHub(TOKEN);
+// Reap a session's tabs after this long with no activity — the backstop for an
+// agent that dies without sending a DELETE (0 disables). Default 30 min.
+const SESSION_IDLE_MS = parseInt(process.env.SESSION_IDLE_MS ?? String(30 * 60_000));
+
+const hub = new ExtensionHub(TOKEN, SESSION_IDLE_MS);
 
 /** Map the hub's connectivity to the ChromeStatus shape the agent already expects.
  *  `sessionId` (the caller's MCP session) adds this session's owned-tab count. */
