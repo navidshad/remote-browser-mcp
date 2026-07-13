@@ -25,6 +25,27 @@ export interface CmdMsg {
   name: string;
   args: Record<string, unknown>;
   deadlineMs: number;
+  /** Logical agent/session that owns the target tabs. Absent => "default". */
+  sessionId?: string;
+}
+
+/** Bridge -> extension: pre-register a session (optional; sessions are also created
+ *  lazily on first cmd). Sent when an MCP client opens a stateful transport. */
+export interface SessionOpenMsg {
+  t: "session_open";
+  sessionId: string;
+}
+
+/** Bridge -> extension: an MCP client disconnected; tear down its owned tabs. */
+export interface SessionCloseMsg {
+  t: "session_close";
+  sessionId: string;
+}
+
+/** Extension -> bridge: ack that a session's tabs were cleaned up. */
+export interface SessionClosedMsg {
+  t: "session_closed";
+  sessionId: string;
 }
 
 /** MCP-shaped content part (text or image), passed straight through to the agent. */
@@ -49,13 +70,19 @@ export interface ResMsg {
   error?: { code?: string; message?: string };
 }
 
-/** Extension -> bridge: debugger attach/detach/tab-close notifications. */
+/** Extension -> bridge: debugger attach/detach/tab-close notifications. The
+ *  top-level fields describe aggregate/most-recent state (kept for the popup and
+ *  legacy status); `sessions` carries the per-session/per-tab breakdown. */
 export interface StatusMsg {
   t: "status";
   attached: boolean;
   tabId?: number | null;
   url?: string | null;
   reason?: string;
+  sessions?: Array<{
+    sessionId: string;
+    tabs: Array<{ tab: string; url: string | null; attached: boolean; active: boolean }>;
+  }>;
 }
 
 /** Bidirectional app-level heartbeat. Native WS ping/pong frames are not
@@ -74,5 +101,12 @@ export interface ErrorMsg {
   code: string;
 }
 
-export type FromExtension = HelloMsg | ResMsg | StatusMsg | PingMsg | PongMsg;
-export type ToExtension = WelcomeMsg | CmdMsg | PingMsg | PongMsg | ErrorMsg;
+export type FromExtension = HelloMsg | ResMsg | StatusMsg | SessionClosedMsg | PingMsg | PongMsg;
+export type ToExtension =
+  | WelcomeMsg
+  | CmdMsg
+  | SessionOpenMsg
+  | SessionCloseMsg
+  | PingMsg
+  | PongMsg
+  | ErrorMsg;

@@ -110,12 +110,19 @@ async function onMessage(data) {
     case "cmd":
       handleCmd(m);
       break;
+    case "session_open":
+      // Lazily materialized; touch it so status reflects the new session.
+      executor.getSession(m.sessionId);
+      break;
+    case "session_close":
+      executor.closeSession(m.sessionId).finally(() => send({ t: "session_closed", sessionId: m.sessionId }));
+      break;
   }
 }
 
 async function handleCmd(m) {
   try {
-    const result = await executor.execute(m.name, m.args || {}, m.deadlineMs);
+    const result = await executor.execute(m.name, m.args || {}, m.deadlineMs, m.sessionId);
     send({ t: "res", id: m.id, ok: true, result });
   } catch (e) {
     send({ t: "res", id: m.id, ok: false, error: { code: e.code || "error", message: String(e.message || e) } });
@@ -159,7 +166,14 @@ function scheduleReconnect() {
 
 // ── status (pushed to bridge + surfaced to the popup) ─────────────────────────
 function pushStatus(attached, tabId, url, reason) {
-  send({ t: "status", attached, tabId: tabId ?? null, url: url ?? null, reason });
+  send({
+    t: "status",
+    attached,
+    tabId: tabId ?? null,
+    url: url ?? null,
+    reason,
+    sessions: executor.sessionsSummary(),
+  });
   chrome.storage.local.set({ lastAttached: attached, lastTabUrl: url ?? null, lastReason: reason ?? null });
 }
 
@@ -169,10 +183,13 @@ function setConn(state) {
 }
 
 function statusSnapshot() {
+  let tabCount = 0;
+  for (const s of executor.sessions.values()) tabCount += s.tabs.size;
   return {
     connState,
     socketOpen: !!socket && socket.readyState === WebSocket.OPEN,
-    attachedTabId: executor.attachedTabId,
-    debuggerAttached: executor.attached,
+    sessionCount: executor.sessions.size,
+    tabCount,
+    debuggerAttached: executor.anyAttached(),
   };
 }

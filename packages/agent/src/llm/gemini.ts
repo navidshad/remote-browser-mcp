@@ -108,29 +108,34 @@ class GeminiSession implements LlmSession {
         response.candidates?.[0]?.content?.parts ?? calls.map((c) => ({ functionCall: c }));
       this.history.push({ role: "model", parts: modelParts });
 
-      // 2. Execute each call; collect one functionResponse part per call.
-      const responseParts: Part[] = [];
-      for (const call of calls) {
-        const name = call.name ?? "";
-        printToolStart(name);
-        let responseObj: Record<string, unknown>;
-        try {
-          const out = await this.deps.callTool(name, (call.args ?? {}) as Record<string, unknown>);
-          printToolEnd(true);
-          // response MUST be an object; Gemini reads the "output"/"error" keys.
-          responseObj = { output: out };
-        } catch (err) {
-          printToolEnd(false, String(err));
-          responseObj = { error: String(err) };
-        }
-        responseParts.push({
-          functionResponse: {
-            name,
-            response: responseObj,
-            ...(call.id ? { id: call.id } : {}),
-          },
-        });
-      }
+      // 2. Execute the calls CONCURRENTLY (so calls on different tabs run in
+      //    parallel), collecting one functionResponse part per call. Promise.all
+      //    preserves index order, which matters: Gemini pairs functionResponse to
+      //    functionCall positionally. Each task must resolve to a part (never throw)
+      //    or the array would collapse and break the pairing.
+      const responseParts: Part[] = await Promise.all(
+        calls.map(async (call): Promise<Part> => {
+          const name = call.name ?? "";
+          printToolStart(name);
+          let responseObj: Record<string, unknown>;
+          try {
+            const out = await this.deps.callTool(name, (call.args ?? {}) as Record<string, unknown>);
+            printToolEnd(true);
+            // response MUST be an object; Gemini reads the "output"/"error" keys.
+            responseObj = { output: out };
+          } catch (err) {
+            printToolEnd(false, String(err));
+            responseObj = { error: String(err) };
+          }
+          return {
+            functionResponse: {
+              name,
+              response: responseObj,
+              ...(call.id ? { id: call.id } : {}),
+            },
+          };
+        })
+      );
 
       // 3. Append tool results as a user turn, then loop.
       this.history.push({ role: "user", parts: responseParts });

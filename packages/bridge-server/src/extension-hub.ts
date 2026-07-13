@@ -9,12 +9,21 @@ import type { FromExtension, ToolResult } from "./protocol.js";
 const HEARTBEAT_MS = 20_000; // < MV3's 30s idle window, so inbound frames keep the SW resident
 const HELLO_TIMEOUT_MS = 5_000;
 
+export interface SessionTab {
+  tab: string;
+  url: string | null;
+  attached: boolean;
+  active: boolean;
+}
+
 export interface HubStatus {
   extensionConnected: boolean;
   debuggerAttached: boolean;
   lastHeartbeatAt: number | null;
   tabId: number | null;
   url: string | null;
+  /** Per-session tab breakdown from the extension's latest status frame. */
+  sessions: Array<{ sessionId: string; tabs: SessionTab[] }>;
 }
 
 interface Pending {
@@ -53,9 +62,36 @@ export class ExtensionHub {
     lastHeartbeatAt: null,
     tabId: null,
     url: null,
+    sessions: [],
   };
+  /** MCP sessions the bridge has opened (so a reconnecting extension can be
+   *  told to re-establish them). Keyed by Mcp-Session-Id. */
+  private openSessions = new Set<string>();
 
   constructor(private readonly token: string) {}
+
+  /** How many tabs a given MCP session currently owns (from the last status). */
+  tabCountFor(sessionId: string | undefined): number {
+    if (!sessionId) return 0;
+    return this.status.sessions.find((s) => s.sessionId === sessionId)?.tabs.length ?? 0;
+  }
+
+  /** Tell the extension a new MCP session exists. Best-effort (no-op if offline;
+   *  the session is also created lazily on its first command). */
+  openSession(sessionId: string): void {
+    this.openSessions.add(sessionId);
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ t: "session_open", sessionId }));
+    }
+  }
+
+  /** Tell the extension an MCP session ended so it tears down that session's tabs. */
+  closeSession(sessionId: string): void {
+    this.openSessions.delete(sessionId);
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({ t: "session_close", sessionId }));
+    }
+  }
 
   attach(wss: WebSocketServer): void {
     wss.on("connection", (ws) => this.onConnection(ws));
@@ -132,6 +168,15 @@ export class ExtensionHub {
     this.socket = ws;
     this.status.extensionConnected = true;
     this.status.lastHeartbeatAt = Date.now();
+    // A fresh extension has no sessions; re-announce the ones we know about so
+    // status reflects them (their tabs, if any, are gone with the old browser).
+    for (const sid of this.openSessions) {
+      try {
+        ws.send(JSON.stringify({ t: "session_open", sessionId: sid }));
+      } catch {
+        /* ignore */
+      }
+    }
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.pingTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -173,7 +218,11 @@ export class ExtensionHub {
         this.status.debuggerAttached = !!msg.attached;
         this.status.tabId = msg.tabId ?? null;
         this.status.url = msg.url ?? null;
+        if (msg.sessions) this.status.sessions = msg.sessions;
         this.status.lastHeartbeatAt = Date.now();
+        break;
+      case "session_closed":
+        // Extension finished tearing down the session's tabs; nothing to await.
         break;
     }
   }
@@ -200,7 +249,8 @@ export class ExtensionHub {
   async sendCommand(
     name: string,
     args: Record<string, unknown>,
-    timeoutMs: number
+    timeoutMs: number,
+    sessionId?: string
   ): Promise<ToolResult> {
     const ws = this.socket;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -221,7 +271,7 @@ export class ExtensionHub {
         });
       }, timeoutMs);
       this.pending.set(id, { settle: resolve, timer });
-      ws.send(JSON.stringify({ t: "cmd", id, name, args, deadlineMs: timeoutMs }), (err) => {
+      ws.send(JSON.stringify({ t: "cmd", id, name, args, deadlineMs: timeoutMs, sessionId }), (err) => {
         if (err) {
           this.pending.delete(id);
           clearTimeout(timer);

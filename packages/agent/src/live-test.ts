@@ -29,7 +29,7 @@ async function main() {
   const session = provider.createSession({
     systemPrompt:
       "You are a browser automation agent with access to a real Chrome browser. " +
-      "Before browser tools, call check_local_status. When navigating, open a new tab. Be concise.",
+      "Before browser tools, call check_local_status. Open tabs with browser_tab_new (returns a handle like 't2') and pass that handle as the `tab` arg to other tools; batch calls for different tabs in one turn to run them in parallel. Be concise.",
     model,
     listTools: () => bridge.listTools(),
     callTool: (name, args) => bridge.callTool(name, args),

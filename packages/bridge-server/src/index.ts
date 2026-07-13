@@ -11,10 +11,11 @@
 // A browser MCP tool call is forwarded over the WS to the extension, which
 // executes it via chrome.debugger and returns an MCP-shaped result.
 import express from "express";
+import { randomUUID } from "crypto";
 import { WebSocketServer } from "ws";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { ExtensionHub } from "./extension-hub.js";
 import { BROWSER_TOOLS } from "./tools.js";
@@ -33,8 +34,9 @@ if (!TOKEN) {
 
 const hub = new ExtensionHub(TOKEN);
 
-/** Map the hub's connectivity to the ChromeStatus shape the agent already expects. */
-function localStatus() {
+/** Map the hub's connectivity to the ChromeStatus shape the agent already expects.
+ *  `sessionId` (the caller's MCP session) adds this session's owned-tab count. */
+function localStatus(sessionId?: string) {
   const s = hub.getStatus();
   if (!s.extensionConnected) {
     return {
@@ -46,15 +48,22 @@ function localStatus() {
         "Open the Aso Dara Chrome window and confirm the Remote Browser extension shows 'connected'.",
     };
   }
+  const owned = hub.tabCountFor(sessionId);
   return {
     online: true,
     chrome_running: true,
     chrome_debug_accessible: true,
-    message: "Bridge online and the agent browser (Aso Dara) is connected and ready for remote control.",
+    tabs_owned: owned,
+    message:
+      "Bridge online and the agent browser (Aso Dara) is connected and ready for remote control." +
+      (owned > 0 ? ` This session owns ${owned} tab(s).` : ""),
   };
 }
 
-function buildServer(): McpServer {
+/** Build an MCP server bound to one caller. `getSessionId` resolves the caller's
+ *  MCP session lazily (it isn't known until `initialize` completes), so every tool
+ *  call is routed to that session's tab group in the extension. */
+function buildServer(getSessionId: () => string | undefined): McpServer {
   const srv = new McpServer({ name: "remote-browser-bridge", version: "0.1.0" });
 
   // Status tool — same name/shape as the daemon's so CONTRACT.md is unchanged.
@@ -64,19 +73,20 @@ function buildServer(): McpServer {
       "Call this before issuing browser commands.",
     { notify: z.boolean().optional().describe("Reserved; accepted for compatibility") },
     async () => ({
-      content: [{ type: "text" as const, text: JSON.stringify(localStatus(), null, 2) }],
+      content: [{ type: "text" as const, text: JSON.stringify(localStatus(getSessionId()), null, 2) }],
     })
   );
 
-  // Browser tools — forwarded verbatim to the extension over the WS. The
-  // extension guarantees MCP-shaped content; cast through the SDK type at the
-  // boundary (text parts carry `text`, image parts carry `data`+`mimeType`).
+  // Browser tools — forwarded verbatim to the extension over the WS, tagged with
+  // the caller's sessionId so tab ownership is isolated per agent. The extension
+  // guarantees MCP-shaped content; cast through the SDK type at the boundary.
   for (const tool of BROWSER_TOOLS) {
     srv.tool(tool.name, tool.description, tool.schema, async (args) => {
       const result = await hub.sendCommand(
         tool.name,
         (args ?? {}) as Record<string, unknown>,
-        tool.timeoutMs
+        tool.timeoutMs,
+        getSessionId()
       );
       return result as unknown as CallToolResult;
     });
@@ -93,11 +103,49 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "remote-browser-bridge", ...hub.getStatus() });
 });
 
-// Stateless Streamable HTTP — new server+transport per request (like the daemon).
+// Stateful Streamable HTTP: one transport per MCP session (keyed by Mcp-Session-Id),
+// so each connected agent gets an isolated tab group in the extension. The MCP SDK
+// client captures the session id on `initialize` and echoes it on every later
+// request — the LLM never sees or threads it, so a session can't be spoofed.
+const transports = new Map<string, StreamableHTTPServerTransport>();
+
 app.all("/mcp", async (req, res) => {
+  const sid = req.headers["mcp-session-id"] as string | undefined;
+
+  // Existing session → reuse its transport (handles POST tool calls, the GET SSE
+  // stream, and the DELETE teardown that fires session cleanup via onclose).
+  if (sid && transports.has(sid)) {
+    await transports.get(sid)!.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // New session → create a stateful transport on the initialize handshake.
+  if (!sid && isInitializeRequest(req.body)) {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id) => {
+        transports.set(id, transport);
+        hub.openSession(id);
+      },
+    });
+    transport.onclose = () => {
+      const id = transport.sessionId;
+      if (id) {
+        transports.delete(id);
+        hub.closeSession(id); // tear down this agent's tabs
+      }
+    };
+    const srv = buildServer(() => transport.sessionId);
+    await srv.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // Back-compat: a header-less, non-initialize call (e.g. a bare stateless client)
+  // runs as a one-shot on the extension's "default" session.
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => transport.close());
-  const srv = buildServer();
+  const srv = buildServer(() => undefined);
   await srv.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });

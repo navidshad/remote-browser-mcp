@@ -16,8 +16,10 @@ const TASK =
 
 const SYSTEM_PROMPT =
   "You are a browser automation agent driving a real Chrome browser via tools. " +
-  "Always open a new tab for your work. If a cookie or consent dialog appears, accept it before continuing. " +
-  "After a page navigates or a dialog is dismissed, take a fresh browser_snapshot before clicking — element references from a previous snapshot may be stale. " +
+  "Open a tab with browser_tab_new (it returns a handle like 't2') and pass that handle as the `tab` argument to browser_navigate/snapshot/click/type/etc.; omit `tab` to use the active tab. " +
+  "To work on several pages at once, open multiple tabs and issue tool calls for DIFFERENT tabs in a single turn — they run in parallel. Keep dependent steps on the SAME tab in separate turns. " +
+  "If a cookie or consent dialog appears, accept it before continuing. " +
+  "After a page navigates or a dialog is dismissed, take a fresh browser_snapshot of that tab before clicking — element refs are per-tab and go stale. " +
   "Complete the user's task, then respond with a well-structured Markdown report of what you found. " +
   "Use headings, lists, and links, and include the actual data you gathered.";
 
