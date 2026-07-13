@@ -1,4 +1,4 @@
-.PHONY: install build dev dev-daemon dev-agent start-local docker-build docker-up docker-down clean help
+.PHONY: install build dev dev-daemon dev-agent chrome-debug aso-window start-local docker-build docker-up docker-down clean help
 
 # ── Install & build ────────────────────────────────────────────────────────────
 
@@ -28,6 +28,20 @@ dev:
 playwright-mcp:
 	npx --yes @playwright/mcp@latest --port 3000 --browser chrome --cdp-endpoint http://localhost:9222
 
+# ── Debuggable Chrome (CDP-port mode) ─────────────────────────────────────────
+
+# Launch a dedicated debug Chrome on port 9222 (separate profile; your normal
+# Chrome is untouched). Required before the agent can drive a page — Chrome 136+
+# blocks debugging on the default profile and the chrome://inspect toggle does
+# not expose a usable port.
+chrome-debug:
+	bash scripts/start-chrome-debug.sh
+
+# Ensure the agent's Chrome profile (ASO_PROFILE_NAME, resolved by name) has a
+# window open so the bridge extension is live. Extension mode; background is fine.
+aso-window:
+	bash scripts/open-aso-window.sh
+
 # ── Host services (M2: with tunnel) ───────────────────────────────────────────
 
 start-local: build
@@ -55,6 +69,8 @@ help:
 	@echo "--------------------------------------"
 	@echo "  make install        Install all dependencies"
 	@echo "  make build          Build all packages"
+	@echo "  make aso-window     Open the agent's Chrome profile window (extension mode)"
+	@echo "  make chrome-debug   Launch dedicated debug Chrome on port 9222 (CDP-port fallback)"
 	@echo "  make dev            M1: start daemon + Playwright MCP locally (no tunnel)"
 	@echo "  make start-local    M2: start all host services + Cloudflare tunnels"
 	@echo "  make docker-up      M2: run the agent inside a Docker container (mock AWS VM)"

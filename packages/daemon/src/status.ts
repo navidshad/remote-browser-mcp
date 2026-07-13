@@ -1,14 +1,20 @@
 import { exec } from "child_process";
 import { promisify } from "util";
+import net from "net";
 
 const execAsync = promisify(exec);
 
 export interface ChromeStatus {
   online: boolean;
   chrome_running: boolean;
+  /** Browser is reachable for remote control. In extension mode this means the
+   *  Playwright MCP bridge is up; in cdp mode it means the CDP port answers. */
   chrome_debug_accessible: boolean;
   message: string;
 }
+
+/** How Playwright MCP attaches to Chrome — mirrors BROWSER_MODE in start-local.sh. */
+const BROWSER_MODE = process.env.BROWSER_MODE ?? "extension";
 
 async function isChromeRunning(): Promise<boolean> {
   try {
@@ -32,6 +38,23 @@ async function isChromeRunning(): Promise<boolean> {
   }
 }
 
+/** True if a TCP server is accepting connections on localhost:port. */
+function isPortOpen(port: number, timeoutMs = 2000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const finish = (v: boolean) => {
+      socket.destroy();
+      resolve(v);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.connect(port, "localhost");
+  });
+}
+
+/** CDP-port mode: Chrome must answer the DevTools endpoint on CDP_PORT. */
 async function isChromeDebugAccessible(): Promise<boolean> {
   const port = process.env.CDP_PORT ?? "9222";
   try {
@@ -44,6 +67,15 @@ async function isChromeDebugAccessible(): Promise<boolean> {
   }
 }
 
+/** Extension mode: readiness = the Playwright MCP bridge server is listening.
+ *  With PLAYWRIGHT_MCP_EXTENSION_TOKEN set it auto-attaches to the paired
+ *  (Aso Dara) profile, so a running server means the browser is drivable —
+ *  provided that profile's Chrome window is open. */
+async function isExtensionBridgeReady(): Promise<boolean> {
+  const port = Number(process.env.PLAYWRIGHT_PORT ?? "3000");
+  return isPortOpen(port);
+}
+
 export async function checkChromeStatus(): Promise<ChromeStatus> {
   const chrome_running = await isChromeRunning();
 
@@ -53,22 +85,26 @@ export async function checkChromeStatus(): Promise<ChromeStatus> {
       chrome_running: false,
       chrome_debug_accessible: false,
       message:
-        "Local machine is online but Chrome is not running. " +
-        "Please open Chrome and enable remote debugging at chrome://inspect/#remote-debugging",
+        BROWSER_MODE === "extension"
+          ? "Local machine is online but Chrome is not running. Open the dedicated agent Chrome profile (Aso Dara)."
+          : "Local machine is online but Chrome is not running. Please open Chrome.",
     };
   }
 
-  const chrome_debug_accessible = await isChromeDebugAccessible();
+  const ready =
+    BROWSER_MODE === "extension"
+      ? await isExtensionBridgeReady()
+      : await isChromeDebugAccessible();
 
-  if (!chrome_debug_accessible) {
+  if (!ready) {
     return {
       online: true,
       chrome_running: true,
       chrome_debug_accessible: false,
       message:
-        "Chrome is running but remote debugging is not accessible. " +
-        "For channel mode: visit chrome://inspect/#remote-debugging and enable it. " +
-        "For CDP port mode: launch Chrome with --remote-debugging-port=9222",
+        BROWSER_MODE === "extension"
+          ? "Chrome is running but the Playwright MCP bridge is not reachable. Make sure host services are up (make start-local) and the Playwright MCP Bridge extension is connected in the Aso Dara profile."
+          : "Chrome is running but remote debugging is not accessible. Launch the debug Chrome: make chrome-debug.",
     };
   }
 
@@ -76,6 +112,9 @@ export async function checkChromeStatus(): Promise<ChromeStatus> {
     online: true,
     chrome_running: true,
     chrome_debug_accessible: true,
-    message: "Local machine is online and Chrome is ready for remote control",
+    message:
+      BROWSER_MODE === "extension"
+        ? "Local machine is online and the agent browser (Aso Dara) is ready for remote control."
+        : "Local machine is online and Chrome is ready for remote control.",
   };
 }

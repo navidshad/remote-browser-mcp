@@ -51,19 +51,23 @@ make install
 make build
 ```
 
-### One-time Chrome setup (channel mode — the v1 default)
+### One-time Chrome setup (extension mode — the v1 default)
 
-1. Open Chrome.
-2. Visit `chrome://inspect/#remote-debugging`.
-3. Enable **"Allow remote debugging for this browser instance."**
+The agent attaches to Chrome through the official **[Playwright MCP Bridge](https://chromewebstore.google.com/detail/playwright-mcp-bridge/mmlmfjhmonkocbjadbfplnigmagldckm)** extension — it drives your **real** profile (logins, cookies, extensions) with no debug flags and no port 9222, so it survives Chrome's 136+/144 restrictions.
 
-This is the Chrome-136-sanctioned way to debug your everyday browser. No launch flags, no separate profile — the agent inherits all your existing logins.
+1. Create a **dedicated Chrome profile** for the agent (e.g. "Aso Dara") — ideally an **account-less, local profile** so Chrome sync can't copy extensions into it or out of it. You log into only the accounts the agent needs (e.g. the company LinkedIn), not your personal ones.
+2. Install the **Playwright MCP Bridge** extension into **only that profile**. This is the isolation boundary: the bridge binds to whichever profile has the extension, so as long as exactly one profile has it, the agent can only ever land there. **If Chrome sync copies it into another profile, isolation breaks** (the connection then follows the active window) — so turn off "Extensions" sync, and `chrome://extensions` → Remove it from every other profile. (`scripts/open-aso-window.sh` warns if it finds the extension in more than one profile.)
+3. Open the extension's status page → copy the `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, and record the profile's display name, in **`scripts/.rbm-env`** (gitignored):
+   ```bash
+   cat > scripts/.rbm-env <<'EOF'
+   export PLAYWRIGHT_MCP_EXTENSION_TOKEN=<paste-token>
+   export ASO_PROFILE_NAME="Aso Dara"
+   EOF
+   ```
+   The token lets `--extension` auto-connect with no dialog (no per-run click). The profile is referenced by **name** — helpers resolve it to its `Profile N` directory, so it survives Chrome renumbering.
+4. **Keep a window of that profile open** whenever the agent may browse — it can sit in the **background; focus is not required**, it just has to exist (otherwise the extension worker isn't loaded and connections time out). `make start-local` auto-opens it; `make aso-window` opens it on demand. This is the *only* ongoing requirement — nothing on the VM references the profile.
 
-> **Fallback (CDP-port mode)** if channel mode is ever blocked: launch a dedicated debuggable Chrome instead:
-> ```bash
-> "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
->   --remote-debugging-port=9222 --user-data-dir=/tmp/rbm-chrome-debug
-> ```
+> **Fallback (CDP-port mode)** if you ever can't use the extension: run with `BROWSER_MODE=cdp` and launch a dedicated debuggable Chrome with `make chrome-debug` (a separate `~/.rbm-chrome-debug` profile — no real logins). Chrome 136+ blocks `--remote-debugging-port` on the default profile, and the `chrome://inspect` "channel mode" toggle does **not** expose a usable CDP port for third-party clients, so a separate profile is required in this mode.
 
 ## Milestones — how to run each
 
@@ -149,24 +153,26 @@ Because the Chrome window is on **your** screen, you can grab the mouse/keyboard
 
 ## `check_local_status` states
 
+`chrome_debug_accessible` is mode-aware: in extension mode it means the Playwright MCP bridge (port 3000) is up; in cdp mode it means the CDP port answers.
+
 | `online` | `chrome_running` | `chrome_debug_accessible` | Meaning |
 |:--:|:--:|:--:|---|
 | true | true  | true  | Ready — agent can drive the browser |
-| true | true  | false | Chrome open but debugging not enabled → enable at `chrome://inspect` |
-| true | false | false | Machine up, Chrome closed → open Chrome |
+| true | true  | false | Chrome open but the bridge isn't reachable → start host services (`make start-local`) / connect the extension |
+| true | false | false | Machine up, Chrome closed → open the agent's (Aso Dara) Chrome window |
 | (unreachable) | — | — | Tunnel/daemon down → agent treats as offline |
 
 ## Security notes
 
 - The Cloudflare Tunnel public URL should be protected (token / Cloudflare Access) before real use.
-- Channel mode opens **no** network debug port; the remote-debugging opt-in is per-instance and local-only.
+- Extension mode opens **no** network debug port; Playwright MCP attaches through the in-browser bridge extension, scoped to its own (Aso Dara) profile — the agent can't reach your personal profile.
 - The daemon never logs page content or screenshots.
 - **`--allowed-hosts`:** Playwright MCP rejects requests whose `Host` header isn't its bound host (DNS-rebinding protection), which a tunnel trips with a `403`. `start-local.sh` passes `--allowed-hosts '*'` so the changing `trycloudflare.com` URL is accepted, relying on the authenticated tunnel as the security boundary. Pin a specific host with `PLAYWRIGHT_ALLOWED_HOSTS=...` once you have a stable tunnel URL.
 
 ## Troubleshooting
 
-- **`Browser context management is not supported`** (from a browser tool) — Playwright is attached to Chrome over CDP and the browser has no usable page/window (e.g. its last tab was closed, leaving 0 page targets). Make sure Chrome has at least one normal window open, then retry. With **channel mode** against your everyday Chrome this is rare (you always have windows open); it mostly bites a minimal dedicated debug profile. A clean reset: close the debug Chrome, delete its `--user-data-dir`, relaunch with a real URL, and restart Playwright MCP.
-- **`check_local_status` says debugging isn't accessible** — enable it at `chrome://inspect/#remote-debugging` (channel mode) or launch Chrome with `--remote-debugging-port=9222` (CDP-port mode).
+- **`Browser context management is not supported`** (from a browser tool) — Playwright has no usable page/window to drive (e.g. the last tab was closed, leaving 0 page targets). In extension mode, make sure the Aso Dara window has at least one normal tab open and the bridge extension is connected, then retry. In the CDP-port fallback this mostly bites a minimal debug profile — a clean reset: close the debug Chrome, delete its `--user-data-dir`, relaunch with a real URL, restart Playwright MCP.
+- **`check_local_status` says the bridge isn't reachable** — make sure host services are up (`make start-local`, under Node 20+) and the Aso Dara window with the Playwright MCP Bridge extension is open. (CDP-port fallback: `make chrome-debug`.)
 - **`403` from Playwright MCP through the tunnel** — see the `--allowed-hosts` note above.
 
 ## Make targets
@@ -174,7 +180,8 @@ Because the Chrome window is on **your** screen, you can grab the mouse/keyboard
 ```
 make install        Install all dependencies
 make build          Build all packages
-make start-local    Start host services + Cloudflare tunnels (M2)
+make start-local    Start host services + Cloudflare tunnels (extension mode by default)
+make chrome-debug   Launch a dedicated debug Chrome on :9222 (CDP-port fallback only)
 make docker-up      Run the agent in a container, mock AWS VM (M2)
 make docker-down    Stop the container
 make dev-daemon     Watch-mode daemon
