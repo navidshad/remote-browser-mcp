@@ -35,6 +35,7 @@ export class Connection {
       (attached, tabId, url, reason) => this.pushStatus(attached, tabId, url, reason),
       profile.name || profile.id
     );
+    this.executor.blockInput = !!profile.blockInput;
   }
 
   log(...args) {
@@ -250,6 +251,7 @@ export class ConnectionManager {
         this.connections.set(id, conn);
       } else {
         conn.profile = p; // pick up name/metadata changes
+        conn.executor.blockInput = !!p.blockInput; // live-apply the popup toggle
       }
       conn.connect();
     }

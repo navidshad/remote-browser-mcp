@@ -184,6 +184,18 @@
       .hidden {
         display: none;
       }
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-weight: 600;
+        margin: 10px 0 0;
+        cursor: pointer;
+      }
+      .check input {
+        width: auto;
+        margin: 0;
+      }
     </style>
   </head>
   <body>
@@ -208,6 +220,9 @@
 
       <label for="token">Access Token</label>
       <input id="token" type="password" placeholder="paste the shared token" spellcheck="false" />
+
+      <label class="check"><input id="blockInput" type="checkbox" /> Block my input while the agent is acting</label>
+      <div class="hint">Suppresses your mouse/keyboard on this profile's tabs during agent activity, so you can't interfere mid-action.</div>
 
       <div class="row">
         <button id="saveProfile">Save</button>

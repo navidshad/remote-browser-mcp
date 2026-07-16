@@ -63,7 +63,7 @@ async function render() {
 
     const name = document.createElement("div");
     name.className = "name";
-    name.textContent = p.name || "(unnamed)";
+    name.textContent = (p.blockInput ? "🔒 " : "") + (p.name || "(unnamed)");
     top.appendChild(name);
 
     const sw = document.createElement("label");
@@ -137,6 +137,7 @@ function openForm(id) {
   $("name").value = p?.name ?? "";
   $("url").value = p?.agentUrl ?? "";
   $("token").value = p?.accessToken ?? "";
+  $("blockInput").checked = !!p?.blockInput;
   $("form").classList.remove("hidden");
 }
 
@@ -149,15 +150,16 @@ function saveForm() {
   const name = $("name").value.trim();
   const agentUrl = $("url").value.trim();
   const accessToken = $("token").value.trim();
+  const blockInput = $("blockInput").checked;
   if (!agentUrl) {
     $("url").focus();
     return;
   }
   if (editingId) {
     const p = profiles.find((x) => x.id === editingId);
-    if (p) Object.assign(p, { name, agentUrl, accessToken });
+    if (p) Object.assign(p, { name, agentUrl, accessToken, blockInput });
   } else {
-    profiles.push({ id: uuid(), name: name || "Bridge", agentUrl, accessToken, enabled: true });
+    profiles.push({ id: uuid(), name: name || "Bridge", agentUrl, accessToken, enabled: true, blockInput });
   }
   closeForm();
   persist();

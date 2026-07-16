@@ -10,7 +10,15 @@
 //     detach one tab to drive another, so different tabs run genuinely in parallel.
 //   • Commands to the SAME tab are serialized by a per-chromeTabId promise lock so
 //     overlapping CDP input events don't interleave; different tabs are unaffected.
-import { SNAPSHOT_FN, RESOLVE_BOX_FN, FOCUS_FN, SELECT_ALL_FN, OVERLAY_FN, OVERLAY_HIDE_FN } from "./page-scripts.js";
+import {
+  SNAPSHOT_FN,
+  RESOLVE_BOX_FN,
+  FOCUS_FN,
+  SELECT_ALL_FN,
+  OVERLAY_FN,
+  OVERLAY_HIDE_FN,
+  ALLOW_INPUT_FN,
+} from "./page-scripts.js";
 
 const PROTOCOL = "1.3";
 const DEFAULT_SESSION = "default";
@@ -84,6 +92,9 @@ export class Executor {
   constructor(pushStatus, label) {
     this.pushStatus = pushStatus;
     this.label = label || "Agent";
+    // When true (per-profile popup toggle), human input is suppressed on agent
+    // tabs while the activity overlay is visible. Updated live by Connection.
+    this.blockInput = false;
     // sessionId -> { id, tabs: Map<handle,{chromeTabId,attached,url}>, activeTab, seq, color, groupId }
     this.sessions = new Map();
     // chromeTabId -> { sessionId, handle } — reverse index for events + ownership
@@ -126,9 +137,26 @@ export class Executor {
   }
 
   /** Flash the in-page activity overlay (ring + action badge) on a tab. Fire-and-
-   *  forget: purely informational for the human watching the window. */
+   *  forget: purely informational for the human watching the window (with
+   *  blockInput it also suppresses human input while visible). */
   showAction(chromeTabId, session, text) {
-    this.evalFn(chromeTabId, OVERLAY_FN, { text, color: COLOR_CSS[session.color] || COLOR_CSS.grey }).catch(() => {});
+    this.evalFn(chromeTabId, OVERLAY_FN, {
+      text,
+      color: COLOR_CSS[session.color] || COLOR_CSS.grey,
+      block: this.blockInput,
+    }).catch(() => {});
+  }
+
+  /** Run an input-dispatching command with the human-input blocker lifted for the
+   *  agent's own CDP events. Safe: per-tab commands are serialized. */
+  async withInputAllowed(chromeTabId, fn) {
+    if (!this.blockInput) return fn();
+    await this.evalFn(chromeTabId, ALLOW_INPUT_FN, true).catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      await this.evalFn(chromeTabId, ALLOW_INPUT_FN, false).catch(() => {});
+    }
   }
 
   allocHandle(session) {
@@ -332,11 +360,13 @@ export class Executor {
         case "browser_snapshot":
           return this.snapshot(chromeTabId);
         case "browser_click":
-          return this.click(chromeTabId, a.ref, a.element);
+          return this.withInputAllowed(chromeTabId, () => this.click(chromeTabId, a.ref, a.element));
         case "browser_type":
-          return this.type(chromeTabId, a.ref, a.text, a.submit, a.slowly, a.append);
+          return this.withInputAllowed(chromeTabId, () =>
+            this.type(chromeTabId, a.ref, a.text, a.submit, a.slowly, a.append)
+          );
         case "browser_press_key":
-          return this.pressKey(chromeTabId, a.key);
+          return this.withInputAllowed(chromeTabId, () => this.pressKey(chromeTabId, a.key));
         case "browser_take_screenshot":
           return this.screenshot(chromeTabId, a.fullPage);
         case "browser_wait_for":

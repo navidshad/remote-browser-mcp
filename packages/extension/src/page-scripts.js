@@ -156,13 +156,20 @@ export const FOCUS_FN = function (ref) {
 };
 
 /** Show/refresh the agent-activity overlay: a colored ring around the viewport
- *  plus a badge with the current action, so a human watching the window can see
- *  what the agent is doing and where. aria-hidden keeps it out of snapshots;
- *  pointer-events:none keeps it out of the way. Auto-fades after a few seconds
- *  of no agent activity (which also clears stale overlays after detach). */
+ *  plus a bottom-center badge with the current action, so a human watching the
+ *  window can see what the agent is doing and where. aria-hidden keeps it out of
+ *  snapshots; pointer-events:none keeps it out of the way. Auto-fades after a few
+ *  seconds of no agent activity (which also clears stale overlays after detach).
+ *
+ *  With arg.block, human input (mouse/keyboard/scroll) is suppressed WHILE the
+ *  overlay is visible — capture-phase listeners swallow events unless the
+ *  executor raised window.__rbmAllowInput around its own CDP-dispatched input.
+ *  Blocking is tied to overlay visibility, so it always self-releases when the
+ *  agent goes idle or detaches (a stale overlay can never lock the page). */
 export const OVERLAY_FN = function (arg) {
   const ID = "__rbm-overlay";
   const color = (arg && arg.color) || "#2563eb";
+  const W = window;
   let host = document.getElementById(ID);
   if (!host) {
     host = document.createElement("div");
@@ -176,7 +183,7 @@ export const OVERLAY_FN = function (arg) {
     const badge = document.createElement("div");
     badge.id = ID + "-badge";
     badge.style.cssText =
-      "position:absolute;top:10px;left:50%;transform:translateX(-50%);max-width:70vw;" +
+      "position:absolute;bottom:14px;left:50%;transform:translateX(-50%);max-width:70vw;" +
       "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
       "font:600 12px/1.6 -apple-system,system-ui,sans-serif;color:#fff;" +
       "padding:3px 14px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.25);";
@@ -189,14 +196,39 @@ export const OVERLAY_FN = function (arg) {
   if (ring) ring.style.boxShadow = "inset 0 0 0 3px " + color + ", inset 0 0 28px " + color + "55";
   if (badge) {
     badge.style.background = color;
-    badge.textContent = "⚡ " + ((arg && arg.text) || "agent active");
+    badge.textContent = (arg && arg.block ? "🔒 " : "⚡ ") + ((arg && arg.text) || "agent active");
+  }
+  W.__rbmBlockEnabled = !!(arg && arg.block);
+  if (W.__rbmBlockEnabled && !W.__rbmBlockInstalled) {
+    W.__rbmBlockInstalled = true;
+    const swallow = function (e) {
+      const h = document.getElementById(ID);
+      const blocking =
+        W.__rbmBlockEnabled && !W.__rbmAllowInput && h && h.style.display !== "none" && h.style.opacity === "1";
+      if (blocking) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
+    };
+    const EVENTS = [
+      "pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick", "contextmenu",
+      "wheel", "touchstart", "touchmove", "keydown", "keypress", "keyup",
+    ];
+    for (const ev of EVENTS) window.addEventListener(ev, swallow, { capture: true, passive: false });
   }
   host.style.display = "";
   host.style.opacity = "1";
-  clearTimeout(window.__rbmOverlayTimer);
-  window.__rbmOverlayTimer = setTimeout(function () {
-    host.style.opacity = "0";
+  clearTimeout(W.__rbmOverlayTimer);
+  W.__rbmOverlayTimer = setTimeout(function () {
+    host.style.opacity = "0"; // fading also releases the input block
   }, 4000);
+  return true;
+};
+
+/** Gate for the input blocker: the executor raises this around its own CDP input
+ *  so the agent's synthesized events pass while the human's are suppressed. */
+export const ALLOW_INPUT_FN = function (allow) {
+  window.__rbmAllowInput = !!allow;
   return true;
 };
 
