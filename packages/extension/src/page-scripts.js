@@ -183,7 +183,7 @@ export const OVERLAY_FN = function (arg) {
     const badge = document.createElement("div");
     badge.id = ID + "-badge";
     badge.style.cssText =
-      "position:absolute;bottom:14px;left:50%;transform:translateX(-50%);max-width:70vw;" +
+      "position:absolute;top:10px;left:50%;transform:translateX(-50%);max-width:70vw;" +
       "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
       "font:600 12px/1.6 -apple-system,system-ui,sans-serif;color:#fff;" +
       "padding:3px 14px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.25);";
