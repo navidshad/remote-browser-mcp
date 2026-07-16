@@ -66,7 +66,9 @@ globalThis.chrome = {
       }
       if (method === "Runtime.evaluate") {
         const e = params.expression;
-        const value = e.includes("document.readyState") ? "complete" : `SNAPSHOT[${t ? t.url : "?"}]`;
+        const value = e.includes("document.readyState")
+          ? { ready: "complete", href: t ? t.url : "about:blank" }
+          : `SNAPSHOT[${t ? t.url : "?"}]`;
         return cb({ result: { value } });
       }
       if (method === "Page.captureScreenshot") return cb({ data: "AAAA" });

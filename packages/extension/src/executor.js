@@ -284,14 +284,17 @@ export class Executor {
     );
   }
 
-  async waitForLoad(tabId, timeoutMs) {
+  /** Poll until the document is loaded. When a navigation is expected
+   *  (`expectNavigation`), the initial about:blank document — whose readyState
+   *  is already "complete" before the navigation commits — doesn't count. */
+  async waitForLoad(tabId, timeoutMs, expectNavigation) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
-        const ready = await this.evalFn(tabId, function () {
-          return document.readyState;
+        const state = await this.evalFn(tabId, function () {
+          return { ready: document.readyState, href: location.href };
         });
-        if (ready === "complete") return;
+        if (state && state.ready === "complete" && (!expectNavigation || state.href !== "about:blank")) return;
       } catch (e) {
         // navigation in flight can briefly drop the context; keep polling
       }
@@ -410,7 +413,7 @@ export class Executor {
     const created = await chrome.tabs.create({ url: url || "about:blank", active: true });
     const handle = this.registerTab(session, created.id, url || "about:blank");
     await this.withTabLock(created.id, () => this.ensureAttached(created.id));
-    if (url) await this.waitForLoad(created.id, Math.min(deadlineMs || 30000, 30000));
+    if (url) await this.waitForLoad(created.id, Math.min(deadlineMs || 30000, 30000), true);
     const info = await chrome.tabs.get(created.id).catch(() => null);
     if (info) session.tabs.get(handle).url = info.url;
     return text(`Opened tab ${handle} — ${info ? info.url : url || "about:blank"}`);

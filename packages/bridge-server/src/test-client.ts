@@ -76,6 +76,11 @@ async function main() {
         : fail(`expected tab_not_owned for client B using client A's handle, got: ${firstText(cross)}`);
     }
     await clientB.close();
+
+    // Tidy up the test tabs (the SDK client's close() doesn't send the DELETE
+    // that ends the session, so without this they linger until the idle reaper).
+    if (handleA) await client.callTool({ name: "browser_tab_close", arguments: { tab: handleA } });
+    if (handleB) await client.callTool({ name: "browser_tab_close", arguments: { tab: handleB } });
   } else {
     console.log("\n  (extension not connected — skipping multi-tab & isolation round-trips)");
   }
