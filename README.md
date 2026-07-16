@@ -1,189 +1,141 @@
 # Remote Browser MCP
 
-Give an AI agent running on a remote VM (e.g. AWS) control of a **real Chrome on your local machine** through the Model Context Protocol — reusing your real logins, cookies, extensions, and home IP, while you can watch and take over at any time.
+Give an AI agent running on a remote VM control of a **real Chrome on your own machine** through the Model Context Protocol — reusing your real logins, cookies, extensions, and home IP, while you watch and take over at any time.
 
-This is an **assembly**, not a from-scratch build. Browser control comes from the official [Playwright MCP](https://github.com/microsoft/playwright-mcp); the cloud→local tunnel comes from Cloudflare Tunnel. What we add is a thin **daemon** (presence detection + a desktop notification when a session starts) and a **terminal agent** that ties it together.
+<p align="center">
+  <img src="docs/infographic.svg" alt="Remote Browser MCP — an AI agent on a cloud VM drives your real local Chrome through an outbound-only MV3 extension" width="100%">
+</p>
 
-See [PRD.md](PRD.md) for the full design rationale.
+Cloud browsers get blocked, fingerprinted, and logged out. Your own Chrome is already trusted everywhere — Remote Browser MCP simply lets your agent use it. The **only thing you install locally is a Chrome extension**. It dials *out* to the agent, so there are no inbound ports, no local tunnel, and no `--remote-debugging` flags on your machine. Set it up once, and any MCP-speaking agent can browse as *you* — while you literally watch it work in your own browser window.
 
-## Architecture
+Perfect for: personal automation agents (LinkedIn outreach, dashboards behind SSO, admin panels), research agents that need sites in your logged-in state, and any workflow where a headless datacenter browser just gets captcha-walled.
+
+See [PRD.md](PRD.md) for the product rationale and [BRIDGE-SETUP.md](BRIDGE-SETUP.md) for the full deployment runbook.
+
+## Features
+
+- 🔐 **Browse as yourself** — the agent works inside your genuine Chrome profile: existing logins, cookies, sessions, extensions, and your home IP. No credential sharing, no re-authentication, no datacenter/bot fingerprint.
+- 📡 **Outbound-only, token-authenticated** — the extension dials out over `wss://` and authenticates with a shared token. Zero inbound ports, zero local tunnels, zero debug flags on your machine.
+- 🔌 **Standard MCP, Playwright-compatible tools** — one Streamable-HTTP MCP endpoint with tool names mirroring the official Playwright MCP (`browser_navigate`, `browser_snapshot`, `browser_click`, …). Works out of the box with Claude Code or any MCP client; agents written against Playwright MCP port over almost unchanged.
+- 👀 **Live activity overlay** — a colored ring + status badge appears on the page whenever the agent acts, so you always know what it's doing. It self-clears the moment the agent goes idle.
+- ✋ **Take over anytime** — it's your real browser window; just grab the mouse. An optional per-profile input-lock prevents you from *accidentally* fighting the agent mid-task, and always self-releases.
+- 🤖 **Multi-agent, multi-profile** — run several Chrome profiles, each dialed into its own bridge. Every MCP session gets its own Chrome tab group, so parallel agents keep their work visually separate and never touch each other's tabs.
+- 🧱 **Profile-level isolation** — a Chrome extension can only act within its own profile. Install it in one dedicated profile and the agent physically cannot reach your personal browsing.
+- 🧪 **Snapshot-driven control** — the agent reads pages as accessibility trees with stable `[ref=eNN]` element ids, then clicks/types by ref. Faster and more reliable than pixel-hunting screenshots (screenshots are there too when needed).
+- 🩺 **Self-healing & observable** — WebSocket heartbeat + `chrome.alarms` keepalive survive MV3 service-worker eviction, reconnect with backoff, and re-attach the debugger lazily. `/health`, `bridge_ping`, and `check_local_status` tell the agent whether a human/browser is actually there. Idle sessions are reaped automatically.
+- 🪶 **Tiny footprint** — no Playwright install, no Node process, no daemon on your machine. One unpacked MV3 extension; everything else lives on the VM.
+
+## How it works
+
+There are two halves that meet over an authenticated WebSocket:
+
+- **On the VM** — [`packages/bridge-server`](packages/bridge-server) exposes browser control to the agent as MCP and relays each command to the browser. It has two faces:
+  - an **MCP** face on `localhost:3000/mcp` — the VM's Claude Code (or [`packages/agent`](packages/agent)) connects here and calls `browser_*` tools;
+  - a **WebSocket** face on `localhost:3002` — the extension dials in and authenticates with a shared token. `cloudflared` running *on the VM* publishes this face at a `wss://` URL.
+- **On your machine** — the [`packages/extension`](packages/extension) MV3 extension runs in a dedicated Chrome profile, dials out to that `wss://` URL, and drives a real tab with `chrome.debugger` (CDP).
 
 ```
-AI agent (terminal app)  ──────────────┐   in dev: runs inside a Docker container
-  on the AWS VM                         │           that mocks the AWS VM
-                                        │  MCP over Streamable HTTP → public tunnel URLs
-                                        v
-                          Cloudflare Tunnel (public URL)
-                                        ^  outbound-only, dialed from the local machine
-                                        │
-  Local machine (your laptop):         │
-    • cloudflared (dials out)          │
-    • Playwright MCP   :3000  ─────────┘   browser tools (navigate/click/type/screenshot)
-    • daemon           :3001               presence + notifications
-        │  CDP
-        v
-    Chrome (your real window & profile)
+   ┌──────────────────────── CLOUD VM ────────────────────────┐        ┌───────────── YOUR MACHINE ─────────────┐
+   │  AI Agent  ──MCP──▶  bridge-server                        │        │  MV3 extension  (Aso Dara profile)     │
+   │  (Claude Code /       ├─ MCP face  localhost:3000/mcp     │        │    │                                    │
+   │   packages/agent)     └─ WS  face  localhost:3002 ◀───────┼── wss ─┼────┘  dials OUT, token-authenticated   │
+   │                          published by cloudflared         │        │    chrome.debugger / CDP  ──▶  a tab   │
+   └───────────────────────────────────────────────────────────┘        └────────────────────────────────────────┘
+                                        ▲                                          nothing inbound on your machine
+                                        └──────── agent never touches localhost; always over the network ─────────
 ```
 
-The agent always reaches the browser **over the network**, never on localhost — in dev as well as prod — so the Docker container reproduces the real NAT path on a single machine.
+Browser tool names **mirror the official [Playwright MCP](https://github.com/microsoft/playwright-mcp)**, so an agent (or contract) written against Playwright MCP works with almost no changes.
+
+## Why not just…
+
+| Alternative | What goes wrong |
+|---|---|
+| **A headless browser on the VM** | Fresh profile with no logins, a datacenter IP, and a bot fingerprint — captchas, blocks, and 2FA prompts everywhere. |
+| **Chrome with `--remote-debugging-port`** | Chrome 136+ blocks it on your default profile, so you lose your real logins anyway — and you're running your browser with an open debug port. |
+| **Tunneling into your machine** | Inbound access to your laptop (tunnel daemons, port forwarding, access policies) just to reach a browser. Here the browser dials *out* instead — there is nothing to reach. |
+| **Sharing credentials with the agent** | Passwords and 2FA secrets in an agent's context. Here the agent gets a browser that is *already* signed in and never sees a credential. |
 
 ## Packages
 
 | Path | What it is |
 |---|---|
-| [`packages/daemon`](packages/daemon) | The MCP sidecar we build. Exposes `check_local_status`; fires a macOS notification (terminal print elsewhere) when a session starts. Never sits in the browser traffic path. |
-| [`packages/agent`](packages/agent) | The terminal agent (mock of the AWS-VM client). Connects to the daemon + Playwright MCP and runs a tool-use loop. The LLM brain is pluggable ([`src/llm`](packages/agent/src/llm)) — **Gemini** by default, Anthropic optional. Includes a no-API-key `smoke` test. |
-| [`docker/`](docker) | `Dockerfile.agent` — the agent as a container (mock AWS VM). |
-| [`scripts/start-local.sh`](scripts/start-local.sh) | Brings up all host services + Cloudflare tunnels. |
+| [`packages/bridge-server`](packages/bridge-server) | VM-side bridge. MCP browser tools ⇄ WebSocket to the extension, with token auth, `/health`, and per-session tab tracking. Exposes `browser_*`, `check_local_status`, and `bridge_ping`. |
+| [`packages/extension`](packages/extension) | The MV3 Chrome extension. Popup for Agent URL + token, a service worker holding one outbound WS per profile (heartbeat + `chrome.alarms` keepalive + reconnect backoff), and a `chrome.debugger` executor. |
+| [`packages/agent`](packages/agent) | A standalone terminal agent — a stand-in for the VM's real client. Connects to the bridge and runs a tool-use loop. LLM is pluggable ([`src/llm`](packages/agent/src/llm)) — **Gemini** by default, Anthropic optional — with a no-API-key `smoke` test. |
+| [`packages/daemon`](packages/daemon) | Legacy local MCP sidecar (presence + session notifications) from the pre-bridge architecture. Kept for reference; superseded by the bridge. |
+
+## Browser tools
+
+All exposed on the one bridge MCP endpoint, mirroring Playwright MCP names:
+
+`browser_navigate` · `browser_snapshot` · `browser_click` · `browser_type` · `browser_press_key` · `browser_take_screenshot` · `browser_wait_for` · `browser_tab_list` · `browser_tab_new` · `browser_tab_select` · `browser_tab_close` · `check_local_status` · `bridge_ping`
+
+`browser_snapshot` returns an accessibility tree whose interactable elements are tagged with `[ref=eNN]` ids; you pass those refs to `browser_click` / `browser_type`. Refs are only valid for that tab's latest snapshot, so re-snapshot after navigation or DOM changes.
 
 ## Prerequisites
 
 - **Node.js 22+**
 - **Google Chrome**
-- **Docker** (for the M2 mock-VM flow)
-- **cloudflared** — `brew install cloudflared` (for the tunnel; M2+)
-- **A Gemini API key** — `export GEMINI_API_KEY=...` (the default LLM provider). To use Claude instead, set `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY=...`.
+- **cloudflared** on the VM (`brew install cloudflared` / apt) — publishes the WebSocket face
+- A shared token: `openssl rand -hex 32` — the same value goes on the VM and in the extension popup
+- *(only for the standalone `packages/agent`)* a **Gemini API key** (`GEMINI_API_KEY`), or set `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY`
 
 ## Quick start
 
+Three steps: run the bridge on the VM, load the extension in Chrome, verify. About ten minutes end to end.
+
 ```bash
-make install
-make build
+npm install
+npm run build
 ```
 
-### One-time Chrome setup (extension mode — the v1 default)
-
-The agent attaches to Chrome through the official **[Playwright MCP Bridge](https://chromewebstore.google.com/detail/playwright-mcp-bridge/mmlmfjhmonkocbjadbfplnigmagldckm)** extension — it drives your **real** profile (logins, cookies, extensions) with no debug flags and no port 9222, so it survives Chrome's 136+/144 restrictions.
-
-1. Create a **dedicated Chrome profile** for the agent (e.g. "Aso Dara") — ideally an **account-less, local profile** so Chrome sync can't copy extensions into it or out of it. You log into only the accounts the agent needs (e.g. the company LinkedIn), not your personal ones.
-2. Install the **Playwright MCP Bridge** extension into **only that profile**. This is the isolation boundary: the bridge binds to whichever profile has the extension, so as long as exactly one profile has it, the agent can only ever land there. **If Chrome sync copies it into another profile, isolation breaks** (the connection then follows the active window) — so turn off "Extensions" sync, and `chrome://extensions` → Remove it from every other profile. (`scripts/open-aso-window.sh` warns if it finds the extension in more than one profile.)
-3. Open the extension's status page → copy the `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, and record the profile's display name, in **`scripts/.rbm-env`** (gitignored):
-   ```bash
-   cat > scripts/.rbm-env <<'EOF'
-   export PLAYWRIGHT_MCP_EXTENSION_TOKEN=<paste-token>
-   export ASO_PROFILE_NAME="Aso Dara"
-   EOF
-   ```
-   The token lets `--extension` auto-connect with no dialog (no per-run click). The profile is referenced by **name** — helpers resolve it to its `Profile N` directory, so it survives Chrome renumbering.
-4. **Keep a window of that profile open** whenever the agent may browse — it can sit in the **background; focus is not required**, it just has to exist (otherwise the extension worker isn't loaded and connections time out). `make start-local` auto-opens it; `make aso-window` opens it on demand. This is the *only* ongoing requirement — nothing on the VM references the profile.
-
-> **Fallback (CDP-port mode)** if you ever can't use the extension: run with `BROWSER_MODE=cdp` and launch a dedicated debuggable Chrome with `make chrome-debug` (a separate `~/.rbm-chrome-debug` profile — no real logins). Chrome 136+ blocks `--remote-debugging-port` on the default profile, and the `chrome://inspect` "channel mode" toggle does **not** expose a usable CDP port for third-party clients, so a separate profile is required in this mode.
-
-## Milestones — how to run each
-
-### M1 — Browser end-to-end, local (no tunnel)
-
-Prove the agent can drive your real Chrome on one machine.
+### 1 · VM — run the bridge
 
 ```bash
-# Terminal 1: daemon + Playwright MCP on the host
-make start-local          # or, without tunnels: see scripts/start-local.sh
+BRIDGE_ACCESS_TOKEN=<token> MCP_PORT=3000 WS_PORT=3002 \
+  node packages/bridge-server/dist/index.js
+# or under pm2:
+BRIDGE_ACCESS_TOKEN=<token> pm2 start packages/bridge-server/dist/index.js --name rbm-bridge
+```
 
-# Terminal 2: verify the whole path with no API key needed
+Publish the WS face with `cloudflared` and point the VM's agent at the MCP face
+(`http://localhost:3000/mcp`). Full ingress config and DNS notes are in
+[BRIDGE-SETUP.md](BRIDGE-SETUP.md).
+
+### 2 · Machine — load the extension (one dedicated profile)
+
+1. Create a **dedicated Chrome profile** for the agent (e.g. "Aso Dara"), ideally an account-less local profile so Chrome sync can't copy the extension into or out of it.
+2. `chrome://extensions` → **Developer mode** → **Load unpacked** → select [`packages/extension/`](packages/extension). Install it in **only** this profile, and turn **off** Extensions sync — that isolation is what keeps the agent off your other profiles.
+3. Open the popup and set **Agent URL** (`wss://…/rbm-ws`) + **Access Token** (the token from step 1) → **Save & Connect**. Status should read *Connected to agent*.
+4. Keep a window of that profile open whenever the agent may browse — **background is fine, focus is not required**. The first command attaches `chrome.debugger` and shows Chrome's "…started debugging this browser" bar; leave it in place.
+
+### 3 · Verify end-to-end
+
+```bash
+# on the VM
+curl -s localhost:3000/health          # → "extensionConnected":true
+node packages/bridge-server/dist/test-client.js   # bridge_ping → "pong"
+```
+
+Or drive the whole path with the standalone agent's no-API-key check:
+
+```bash
 npm run smoke --workspace=packages/agent
 ```
 
-Expected smoke-test output:
-
-```
-Daemon:
-  ✓ connected to http://localhost:3001/mcp
-  ✓ check_local_status tool present
-  ✓ machine reported online
-Playwright MCP:
-  ✓ connected to http://localhost:3000
-  ✓ browser tools present (23 tools)
-Browser drive:
-  ✓ navigated to https://example.com
-✓ All checks passed.
-```
-
-Then drive the browser with the LLM. The `live` script runs one task end-to-end
-(handy for a quick check); `start` is the interactive REPL:
+## Development
 
 ```bash
-# One-shot live task (uses GEMINI_API_KEY from your environment / .env)
-GEMINI_API_KEY=... \
-DAEMON_URL=http://localhost:3001/mcp PLAYWRIGHT_URL=http://localhost:3000 \
-TASK="Open a new tab, go to example.com, and tell me the page title." \
-npm run live --workspace=packages/agent
-
-# Interactive REPL
-GEMINI_API_KEY=... \
-DAEMON_URL=http://localhost:3001/mcp \
-PLAYWRIGHT_URL=http://localhost:3000 \
-npm run start --workspace=packages/agent
+npm run test:mock       # bridge round-trip against a fake-extension WS client
+npm run test:profiles   # multi-profile / multi-session harness
+npm run build --workspaces
 ```
 
-The agent runs a tool-use loop: it calls `check_local_status`, opens a new tab,
-navigates, and reports back. Switch the brain with `LLM_PROVIDER=anthropic` (and
-`ANTHROPIC_API_KEY`); override the model with `MODEL=...`.
-
-### M2 — Tunnel + Docker mock VM (the real NAT path)
-
-```bash
-# Terminal 1: host services + Cloudflare tunnels
-make start-local
-```
-
-`cloudflared` prints two `https://*.trycloudflare.com` URLs — one for Playwright MCP (:3000), one for the daemon (:3001). Put them in `.env`:
-
-```bash
-cp .env.example .env
-# Edit .env:
-#   PLAYWRIGHT_URL=https://<playwright>.trycloudflare.com
-#   DAEMON_URL=https://<daemon>.trycloudflare.com/mcp
-#   GEMINI_API_KEY=...
-```
-
-```bash
-# Terminal 2: run the agent inside the container, reaching the host ONLY via tunnel
-make docker-up
-```
-
-The container has no browser and no localhost access to the host — exactly like the production AWS VM. If you point it at `http://localhost:...` instead of the tunnel, it fails to connect: that failure *is* the NAT problem this product solves.
-
-### M3 — Daemon (presence + notification)
-
-Built into the daemon. `check_local_status` reports three states; when the agent starts a session it calls it with `notify=true`, firing a native macOS notification (a terminal print on other OSes). The agent calls this automatically before its first browser command.
-
-### M4 — Hardening & human handoff
-
-Because the Chrome window is on **your** screen, you can grab the mouse/keyboard and take over at any time — for captchas, strict bot checks, or sensitive logins. The agent pauses, you finish the step, the agent continues in the same window. The agent also: retries the Playwright connection on the first browser command, surfaces a clear "machine offline" error if the daemon/tunnel is unreachable, and notifies you on every session start so a live session is never silent.
-
-## `check_local_status` states
-
-`chrome_debug_accessible` is mode-aware: in extension mode it means the Playwright MCP bridge (port 3000) is up; in cdp mode it means the CDP port answers.
-
-| `online` | `chrome_running` | `chrome_debug_accessible` | Meaning |
-|:--:|:--:|:--:|---|
-| true | true  | true  | Ready — agent can drive the browser |
-| true | true  | false | Chrome open but the bridge isn't reachable → start host services (`make start-local`) / connect the extension |
-| true | false | false | Machine up, Chrome closed → open the agent's (Aso Dara) Chrome window |
-| (unreachable) | — | — | Tunnel/daemon down → agent treats as offline |
+Each package also has `dev` (tsx watch), `start`, and `typecheck` scripts.
 
 ## Security notes
 
-- The Cloudflare Tunnel public URL should be protected (token / Cloudflare Access) before real use.
-- Extension mode opens **no** network debug port; Playwright MCP attaches through the in-browser bridge extension, scoped to its own (Aso Dara) profile — the agent can't reach your personal profile.
-- The daemon never logs page content or screenshots.
-- **`--allowed-hosts`:** Playwright MCP rejects requests whose `Host` header isn't its bound host (DNS-rebinding protection), which a tunnel trips with a `403`. `start-local.sh` passes `--allowed-hosts '*'` so the changing `trycloudflare.com` URL is accepted, relying on the authenticated tunnel as the security boundary. Pin a specific host with `PLAYWRIGHT_ALLOWED_HOSTS=...` once you have a stable tunnel URL.
-
-## Troubleshooting
-
-- **`Browser context management is not supported`** (from a browser tool) — Playwright has no usable page/window to drive (e.g. the last tab was closed, leaving 0 page targets). In extension mode, make sure the Aso Dara window has at least one normal tab open and the bridge extension is connected, then retry. In the CDP-port fallback this mostly bites a minimal debug profile — a clean reset: close the debug Chrome, delete its `--user-data-dir`, relaunch with a real URL, restart Playwright MCP.
-- **`check_local_status` says the bridge isn't reachable** — make sure host services are up (`make start-local`, under Node 20+) and the Aso Dara window with the Playwright MCP Bridge extension is open. (CDP-port fallback: `make chrome-debug`.)
-- **`403` from Playwright MCP through the tunnel** — see the `--allowed-hosts` note above.
-
-## Make targets
-
-```
-make install        Install all dependencies
-make build          Build all packages
-make start-local    Start host services + Cloudflare tunnels (extension mode by default)
-make chrome-debug   Launch a dedicated debug Chrome on :9222 (CDP-port fallback only)
-make docker-up      Run the agent in a container, mock AWS VM (M2)
-make docker-down    Stop the container
-make dev-daemon     Watch-mode daemon
-make clean          Remove build artifacts
-```
+- **Auth is an in-band token handshake** on the WebSocket — a browser can't send `CF-Access-*` headers, so the WS hostname must have no Cloudflare Access policy in front of it. The MCP face stays localhost-only on the VM and is never tunneled.
+- **The extension is the trust boundary.** It can drive any tab in its profile via `chrome.debugger`; keep it in a dedicated profile with only the accounts the agent needs.
+- **Keepalive is the known risk.** MV3 evicts idle service workers; the WS heartbeat keeps it resident and a 1-minute `chrome.alarms` revives it, re-attaching `chrome.debugger` lazily on the next command.
