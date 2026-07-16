@@ -1,10 +1,43 @@
-// Executes browser commands against the agent tab via chrome.debugger (CDP).
-// Owns target-tab resolution, lazy debugger attach (so the "started debugging"
-// infobar isn't re-shown on every idle/eviction cycle), and the mapping of each
-// mirrored Playwright tool name to CDP commands.
-import { SNAPSHOT_FN, RESOLVE_BOX_FN, FOCUS_FN, SELECT_ALL_FN } from "./page-scripts.js";
+// Executes browser commands against per-session tabs via chrome.debugger (CDP).
+//
+// Multi-agent / multi-tab model:
+//   • A "session" is one logical agent (keyed by the MCP Mcp-Session-Id the bridge
+//     passes down; header-less callers share the "default" session for back-compat).
+//   • Each session OWNS a set of tabs, addressed by opaque per-session handles
+//     ("t1", "t2", …) — the agent never sees raw chrome tabIds. A session can only
+//     act on handles it owns (resolveOwnedTab enforces this).
+//   • The debugger attaches to many tabs at once (attach is per-target); we never
+//     detach one tab to drive another, so different tabs run genuinely in parallel.
+//   • Commands to the SAME tab are serialized by a per-chromeTabId promise lock so
+//     overlapping CDP input events don't interleave; different tabs are unaffected.
+import {
+  SNAPSHOT_FN,
+  RESOLVE_BOX_FN,
+  FOCUS_FN,
+  SELECT_ALL_FN,
+  OVERLAY_FN,
+  OVERLAY_HIDE_FN,
+  ALLOW_INPUT_FN,
+} from "./page-scripts.js";
 
 const PROTOCOL = "1.3";
+const DEFAULT_SESSION = "default";
+
+// Per-session identity color, used for BOTH the Chrome tab group and the
+// in-page activity overlay ring, so a human can match tabs to the agent
+// driving them at a glance. Names are chrome.tabGroups colors.
+const SESSION_COLORS = ["blue", "green", "purple", "orange", "pink", "cyan", "red", "yellow"];
+const COLOR_CSS = {
+  blue: "#2563eb",
+  green: "#16a34a",
+  purple: "#9333ea",
+  orange: "#ea580c",
+  pink: "#db2777",
+  cyan: "#0891b2",
+  red: "#dc2626",
+  yellow: "#ca8a04",
+  grey: "#6b7280",
+};
 
 const KEY_MAP = {
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
@@ -24,6 +57,28 @@ const KEY_MAP = {
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 
+/** Human-readable overlay caption for an agent command. */
+function actionText(name, a) {
+  switch (name) {
+    case "browser_navigate":
+      return `navigate → ${a.url || ""}`;
+    case "browser_click":
+      return `click: ${a.element || a.ref || ""}`;
+    case "browser_type":
+      return `type into ${a.element || a.ref || ""}`;
+    case "browser_press_key":
+      return `press ${a.key || "key"}`;
+    case "browser_take_screenshot":
+      return "screenshot";
+    case "browser_snapshot":
+      return "reading page";
+    case "browser_wait_for":
+      return a.time != null ? `wait ${a.time}s` : `waiting for "${a.text ?? a.textGone ?? ""}"`;
+    default:
+      return name.replace(/^browser_/, "").replace(/_/g, " ");
+  }
+}
+
 class ToolError extends Error {
   constructor(code, message) {
     super(message);
@@ -32,30 +87,188 @@ class ToolError extends Error {
 }
 
 export class Executor {
-  /** @param {(attached: boolean, tabId: number|null, url: string|null, reason?: string) => void} pushStatus */
-  constructor(pushStatus) {
+  /** @param {(attached: boolean, tabId: number|null, url: string|null, reason?: string) => void} pushStatus
+   *  @param {string} [label] group-title label for this executor's tab groups (e.g. the profile name) */
+  constructor(pushStatus, label) {
     this.pushStatus = pushStatus;
-    this.attached = false;
-    this.attachedTabId = null;
+    this.label = label || "Agent";
+    // When true (per-profile popup toggle), human input is suppressed on agent
+    // tabs while the activity overlay is visible. Updated live by Connection.
+    this.blockInput = false;
+    // sessionId -> { id, tabs: Map<handle,{chromeTabId,attached,url}>, activeTab, seq, color, groupId }
+    this.sessions = new Map();
+    // chromeTabId -> { sessionId, handle } — reverse index for events + ownership
+    this.tabIndex = new Map();
+    // chromeTabId -> Promise — per-tab serialization of CDP command chains
+    this.tabLocks = new Map();
+  }
+
+  // ── session / tab bookkeeping ────────────────────────────────────────────────
+  getSession(sessionId) {
+    const id = sessionId || DEFAULT_SESSION;
+    let s = this.sessions.get(id);
+    if (!s) {
+      const color = SESSION_COLORS[this.sessions.size % SESSION_COLORS.length];
+      s = { id, tabs: new Map(), activeTab: null, seq: 0, color, groupId: null };
+      this.sessions.set(id, s);
+    }
+    return s;
+  }
+
+  /** Put a tab into the session's Chrome tab group (creating it on first use) so
+   *  each agent's tabs are visually bundled. Best-effort: grouping is cosmetic
+   *  and must never fail a command. */
+  async ensureGrouped(session, chromeTabId) {
+    if (!chrome.tabs.group || !chrome.tabGroups) return;
+    try {
+      if (session.groupId != null) {
+        try {
+          await chrome.tabs.group({ tabIds: [chromeTabId], groupId: session.groupId });
+          return;
+        } catch (e) {
+          session.groupId = null; // group was closed — recreate below
+        }
+      }
+      session.groupId = await chrome.tabs.group({ tabIds: [chromeTabId] });
+      await chrome.tabGroups.update(session.groupId, { title: this.label, color: session.color });
+    } catch (e) {
+      // tab may have closed mid-flight, or grouping unsupported — ignore
+    }
+  }
+
+  /** Flash the in-page activity overlay (ring + action badge) on a tab. Fire-and-
+   *  forget: purely informational for the human watching the window (with
+   *  blockInput it also suppresses human input while visible). */
+  showAction(chromeTabId, session, text) {
+    this.evalFn(chromeTabId, OVERLAY_FN, {
+      text,
+      color: COLOR_CSS[session.color] || COLOR_CSS.grey,
+      block: this.blockInput,
+    }).catch(() => {});
+  }
+
+  /** Run an input-dispatching command with the human-input blocker lifted for the
+   *  agent's own CDP events. Safe: per-tab commands are serialized. */
+  async withInputAllowed(chromeTabId, fn) {
+    if (!this.blockInput) return fn();
+    await this.evalFn(chromeTabId, ALLOW_INPUT_FN, true).catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      await this.evalFn(chromeTabId, ALLOW_INPUT_FN, false).catch(() => {});
+    }
+  }
+
+  allocHandle(session) {
+    return "t" + ++session.seq;
+  }
+
+  /** Register a chrome tab under a session, allocate a handle, make it active. */
+  registerTab(session, chromeTabId, url) {
+    const handle = this.allocHandle(session);
+    session.tabs.set(handle, { chromeTabId, attached: false, url: url ?? null });
+    this.tabIndex.set(chromeTabId, { sessionId: session.id, handle });
+    session.activeTab = handle;
+    return handle;
+  }
+
+  unregisterTab(session, handle) {
+    const rec = session.tabs.get(handle);
+    if (rec) this.tabIndex.delete(rec.chromeTabId);
+    session.tabs.delete(handle);
+    if (session.activeTab === handle) {
+      const next = session.tabs.keys().next();
+      session.activeTab = next.done ? null : next.value;
+    }
+  }
+
+  anyAttached() {
+    for (const idx of this.tabIndex.values()) {
+      const rec = this.sessions.get(idx.sessionId)?.tabs.get(idx.handle);
+      if (rec && rec.attached) return true;
+    }
+    return false;
+  }
+
+  /** Per-session/per-tab breakdown for StatusMsg. */
+  sessionsSummary() {
+    const out = [];
+    for (const s of this.sessions.values()) {
+      out.push({
+        sessionId: s.id,
+        tabs: [...s.tabs].map(([handle, rec]) => ({
+          tab: handle,
+          url: rec.url ?? null,
+          attached: !!rec.attached,
+          active: handle === s.activeTab,
+        })),
+      });
+    }
+    return out;
+  }
+
+  /** Find the active usable tab and adopt it into the default session (back-compat:
+   *  header-less callers with no explicit tab drive the current window like before). */
+  async adoptActiveTab(session) {
+    const tabs = await chrome.tabs.query({});
+    const usable = (t) =>
+      t.id != null &&
+      t.url &&
+      !t.url.startsWith("chrome://") &&
+      !t.url.startsWith("devtools://") &&
+      !this.tabIndex.has(t.id); // not already owned by some session
+    const cand = tabs.find((t) => t.active && usable(t)) || tabs.find(usable);
+    if (!cand) return null;
+    const handle = this.registerTab(session, cand.id, cand.url);
+    await this.ensureGrouped(session, cand.id);
+    return { handle, chromeTabId: cand.id };
+  }
+
+  /** Resolve args.tab (or the session's active tab) to an owned chrome tab. Opens a
+   *  fresh tab if the session has none yet. Throws if the handle isn't owned. */
+  async resolveOwnedTab(session, tab) {
+    if (tab != null) {
+      const rec = session.tabs.get(tab);
+      if (!rec) {
+        throw new ToolError(
+          "tab_not_owned",
+          `tab ${tab} is not owned by this session — open one with browser_tab_new or list yours with browser_tab_list`
+        );
+      }
+      return { handle: tab, chromeTabId: rec.chromeTabId };
+    }
+    if (session.activeTab && session.tabs.has(session.activeTab)) {
+      return { handle: session.activeTab, chromeTabId: session.tabs.get(session.activeTab).chromeTabId };
+    }
+    if (session.id === DEFAULT_SESSION) {
+      const adopted = await this.adoptActiveTab(session);
+      if (adopted) return adopted;
+    }
+    const created = await chrome.tabs.create({ url: "about:blank", active: true });
+    const handle = this.registerTab(session, created.id, "about:blank");
+    await this.ensureGrouped(session, created.id);
+    return { handle, chromeTabId: created.id };
   }
 
   // ── lifecycle hooks (wired to chrome.* events in sw.js) ─────────────────────
   onDetach(source, reason) {
-    if (source && source.tabId === this.attachedTabId) {
-      this.attached = false;
-      // Don't auto-reattach: if the user hit the infobar "Cancel" (reason
-      // "canceled_by_user") the next command reattaches and re-shows the bar.
-      this.pushStatus(false, this.attachedTabId, null, reason);
-    }
+    if (!source || source.tabId == null) return;
+    const idx = this.tabIndex.get(source.tabId);
+    if (!idx) return;
+    const rec = this.sessions.get(idx.sessionId)?.tabs.get(idx.handle);
+    if (rec) rec.attached = false;
+    // Don't auto-reattach: if the user hit the infobar "Cancel" the next command
+    // reattaches and re-shows the bar. Report aggregate attach state.
+    this.pushStatus(this.anyAttached(), source.tabId, null, reason);
   }
 
   onTabRemoved(tabId) {
-    if (tabId === this.attachedTabId) {
-      this.attached = false;
-      this.attachedTabId = null;
-      chrome.storage.local.remove(["attachedTabId", "attachedTabUrl"]);
-      this.pushStatus(false, null, null, "tab_closed");
-    }
+    const idx = this.tabIndex.get(tabId);
+    if (!idx) return;
+    const session = this.sessions.get(idx.sessionId);
+    if (session) this.unregisterTab(session, idx.handle);
+    this.tabLocks.delete(tabId);
+    this.pushStatus(this.anyAttached(), null, null, "tab_closed");
   }
 
   // ── CDP helpers ─────────────────────────────────────────────────────────────
@@ -83,99 +296,114 @@ export class Executor {
     return res && res.result ? res.result.value : undefined;
   }
 
-  async resolveTabId() {
-    let tabId = this.attachedTabId;
-    if (tabId != null) {
-      try {
-        await chrome.tabs.get(tabId);
-        return tabId;
-      } catch (e) {
-        tabId = null;
-      }
-    }
-    const { attachedTabUrl } = await chrome.storage.local.get("attachedTabUrl");
-    const tabs = await chrome.tabs.query({});
-    const usable = (t) => t.id != null && t.url && !t.url.startsWith("chrome://") && !t.url.startsWith("devtools://");
-    let cand = attachedTabUrl ? tabs.find((t) => t.url === attachedTabUrl && usable(t)) : null;
-    if (!cand) cand = tabs.find((t) => t.active && usable(t));
-    if (!cand) cand = tabs.find(usable);
-    if (cand) return cand.id;
-    const created = await chrome.tabs.create({ url: "about:blank" });
-    return created.id;
-  }
-
-  async ensureAttached(targetTabId) {
-    const tabId = targetTabId != null ? targetTabId : await this.resolveTabId();
-    if (this.attached && this.attachedTabId === tabId) return tabId;
-    if (this.attached && this.attachedTabId != null && this.attachedTabId !== tabId) {
-      try {
-        await new Promise((r) => chrome.debugger.detach({ tabId: this.attachedTabId }, () => r()));
-      } catch (e) {}
-    }
+  /** Attach the debugger to a specific tab (idempotent; never detaches others). */
+  async ensureAttached(chromeTabId) {
+    const idx = this.tabIndex.get(chromeTabId);
+    const rec = idx ? this.sessions.get(idx.sessionId)?.tabs.get(idx.handle) : null;
+    if (rec && rec.attached) return chromeTabId;
     await new Promise((resolve, reject) => {
-      chrome.debugger.attach({ tabId }, PROTOCOL, () => {
+      chrome.debugger.attach({ tabId: chromeTabId }, PROTOCOL, () => {
         const err = chrome.runtime.lastError;
-        if (err && !/already attached/i.test(err.message)) reject(new Error(err.message));
+        if (err && !/already attached/i.test(err.message)) reject(new ToolError("attach_failed", err.message));
         else resolve();
       });
     });
-    this.attached = true;
-    this.attachedTabId = tabId;
-    await this.sendCdp(tabId, "Page.enable", {});
-    await this.sendCdp(tabId, "Runtime.enable", {});
-    const info = await chrome.tabs.get(tabId).catch(() => null);
-    await chrome.storage.local.set({ attachedTabId: tabId, attachedTabUrl: info ? info.url : null });
-    this.pushStatus(true, tabId, info ? info.url : null);
-    return tabId;
+    await this.sendCdp(chromeTabId, "Page.enable", {});
+    await this.sendCdp(chromeTabId, "Runtime.enable", {});
+    if (rec) rec.attached = true;
+    const info = await chrome.tabs.get(chromeTabId).catch(() => null);
+    if (rec && info) rec.url = info.url;
+    this.pushStatus(true, chromeTabId, info ? info.url : null);
+    return chromeTabId;
+  }
+
+  /** Serialize command chains per chrome tab; different tabs run concurrently. */
+  withTabLock(chromeTabId, fn) {
+    const prev = this.tabLocks.get(chromeTabId) || Promise.resolve();
+    const next = prev.then(fn, fn);
+    this.tabLocks.set(
+      chromeTabId,
+      next.then(
+        () => {},
+        () => {}
+      )
+    );
+    return next;
   }
 
   // ── command dispatch ─────────────────────────────────────────────────────────
-  async execute(name, args, deadlineMs) {
+  async execute(name, args, deadlineMs, sessionId) {
     if (name === "bridge_ping") return text("pong");
 
-    if (name === "browser_tab_list") return this.tabList();
-    if (name === "browser_tab_new") return this.tabNew(args.url);
-    if (name === "browser_tab_close") return this.tabClose(args.index);
+    const session = this.getSession(sessionId);
+    const a = args || {};
 
-    const tabId = await this.ensureAttached();
-    switch (name) {
-      case "browser_navigate":
-        return this.navigate(tabId, args.url, deadlineMs);
-      case "browser_snapshot":
-        return this.snapshot(tabId);
-      case "browser_click":
-        return this.click(tabId, args.ref, args.element);
-      case "browser_type":
-        return this.type(tabId, args.ref, args.text, args.submit, args.slowly, args.append);
-      case "browser_press_key":
-        return this.pressKey(tabId, args.key);
-      case "browser_take_screenshot":
-        return this.screenshot(tabId, args.fullPage);
-      case "browser_wait_for":
-        return this.waitFor(tabId, args, deadlineMs);
-      default:
-        throw new ToolError("unknown_tool", `unknown tool: ${name}`);
-    }
+    // Tab-management commands operate on the session directly (no CDP attach).
+    if (name === "browser_tab_list") return this.tabList(session);
+    if (name === "browser_tab_new") return this.tabNew(session, a.url, deadlineMs);
+    if (name === "browser_tab_close") return this.tabClose(session, a.tab);
+    if (name === "browser_tab_select") return this.tabSelect(session, a.tab);
+
+    // Action commands run against one owned tab, serialized per tab.
+    const { handle, chromeTabId } = await this.resolveOwnedTab(session, a.tab);
+    return this.withTabLock(chromeTabId, async () => {
+      await this.ensureAttached(chromeTabId);
+      if (name === "browser_take_screenshot") {
+        // Hide the overlay first so captures show the page, not our ring/badge.
+        await this.evalFn(chromeTabId, OVERLAY_HIDE_FN).catch(() => {});
+      } else {
+        this.showAction(chromeTabId, session, actionText(name, a));
+      }
+      switch (name) {
+        case "browser_navigate":
+          return this.navigate(session, handle, chromeTabId, a.url, deadlineMs);
+        case "browser_snapshot":
+          return this.snapshot(chromeTabId);
+        case "browser_click":
+          return this.withInputAllowed(chromeTabId, () => this.click(chromeTabId, a.ref, a.element));
+        case "browser_type":
+          return this.withInputAllowed(chromeTabId, () =>
+            this.type(chromeTabId, a.ref, a.text, a.submit, a.slowly, a.append)
+          );
+        case "browser_press_key":
+          return this.withInputAllowed(chromeTabId, () => this.pressKey(chromeTabId, a.key));
+        case "browser_take_screenshot":
+          return this.screenshot(chromeTabId, a.fullPage);
+        case "browser_wait_for":
+          return this.waitFor(chromeTabId, a, deadlineMs);
+        default:
+          throw new ToolError("unknown_tool", `unknown tool: ${name}`);
+      }
+    });
   }
 
   // ── commands ─────────────────────────────────────────────────────────────────
-  async navigate(tabId, url, deadlineMs) {
+  async navigate(session, handle, tabId, url, deadlineMs) {
     if (!url) throw new ToolError("bad_args", "url is required");
     await this.sendCdp(tabId, "Page.navigate", { url });
     await this.waitForLoad(tabId, Math.min(deadlineMs || 30000, 30000));
+    // The navigation wiped the page (and the overlay with it) — re-show it so
+    // the ring stays visible on the freshly loaded document.
+    this.showAction(tabId, session, `navigate → ${url}`);
     const info = await chrome.tabs.get(tabId).catch(() => null);
-    await chrome.storage.local.set({ attachedTabUrl: info ? info.url : url });
-    return text(`Navigated to ${url}\nFinal URL: ${info ? info.url : url}\nTitle: ${info ? info.title : ""}`);
+    const rec = session.tabs.get(handle);
+    if (rec && info) rec.url = info.url;
+    return text(
+      `[${handle}] Navigated to ${url}\nFinal URL: ${info ? info.url : url}\nTitle: ${info ? info.title : ""}`
+    );
   }
 
-  async waitForLoad(tabId, timeoutMs) {
+  /** Poll until the document is loaded. When a navigation is expected
+   *  (`expectNavigation`), the initial about:blank document — whose readyState
+   *  is already "complete" before the navigation commits — doesn't count. */
+  async waitForLoad(tabId, timeoutMs, expectNavigation) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       try {
-        const ready = await this.evalFn(tabId, function () {
-          return document.readyState;
+        const state = await this.evalFn(tabId, function () {
+          return { ready: document.readyState, href: location.href };
         });
-        if (ready === "complete") return;
+        if (state && state.ready === "complete" && (!expectNavigation || state.href !== "about:blank")) return;
       } catch (e) {
         // navigation in flight can briefly drop the context; keep polling
       }
@@ -278,30 +506,69 @@ export class Executor {
     throw new ToolError("wait_timeout", "wait_for condition not met before timeout");
   }
 
-  // ── tabs ─────────────────────────────────────────────────────────────────────
-  async tabList() {
-    const tabs = await chrome.tabs.query({});
-    const lines = tabs.map(
-      (t, i) => `${i}: ${t.active ? "*" : " "} ${t.title || "(untitled)"} — ${t.url || ""}`
-    );
-    return text(lines.join("\n") || "(no tabs)");
+  // ── tabs (session-scoped) ─────────────────────────────────────────────────────
+  async tabList(session) {
+    if (session.tabs.size === 0) return text("(no tabs — open one with browser_tab_new)");
+    const lines = [];
+    for (const [handle, rec] of session.tabs) {
+      const info = await chrome.tabs.get(rec.chromeTabId).catch(() => null);
+      const active = handle === session.activeTab ? "*" : " ";
+      lines.push(`${handle}: ${active} ${info ? info.title || "(untitled)" : "(gone)"} — ${info ? info.url : rec.url || ""}`);
+    }
+    return text(lines.join("\n"));
   }
 
-  async tabNew(url) {
+  async tabNew(session, url, deadlineMs) {
     const created = await chrome.tabs.create({ url: url || "about:blank", active: true });
-    await this.ensureAttached(created.id);
-    if (url) await this.waitForLoad(created.id, 30000);
+    const handle = this.registerTab(session, created.id, url || "about:blank");
+    await this.ensureGrouped(session, created.id);
+    await this.withTabLock(created.id, () => this.ensureAttached(created.id));
+    if (url) await this.waitForLoad(created.id, Math.min(deadlineMs || 30000, 30000), true);
+    this.showAction(created.id, session, `opened ${handle}${url ? ` → ${url}` : ""}`);
     const info = await chrome.tabs.get(created.id).catch(() => null);
-    return text(`Opened tab — ${info ? info.url : url || "about:blank"}`);
+    if (info) session.tabs.get(handle).url = info.url;
+    return text(`Opened tab ${handle} — ${info ? info.url : url || "about:blank"}`);
   }
 
-  async tabClose(index) {
-    const tabs = await chrome.tabs.query({});
-    let target;
-    if (index != null) target = tabs[index];
-    else target = tabs.find((t) => t.id === this.attachedTabId) || tabs.find((t) => t.active);
-    if (!target) throw new ToolError("no_tab", "no tab to close");
-    await chrome.tabs.remove(target.id);
-    return text(`Closed tab ${index != null ? index : "(active)"}`);
+  async tabClose(session, tab) {
+    const handle = tab != null ? tab : session.activeTab;
+    if (!handle || !session.tabs.has(handle)) {
+      throw new ToolError("tab_not_owned", `no such tab ${tab ?? "(active)"} in this session`);
+    }
+    const rec = session.tabs.get(handle);
+    try {
+      await new Promise((r) => chrome.debugger.detach({ tabId: rec.chromeTabId }, () => r()));
+    } catch (e) {}
+    await chrome.tabs.remove(rec.chromeTabId).catch(() => {});
+    this.tabLocks.delete(rec.chromeTabId);
+    this.unregisterTab(session, handle);
+    return text(`Closed tab ${handle}`);
+  }
+
+  async tabSelect(session, tab) {
+    if (tab == null || !session.tabs.has(tab)) {
+      throw new ToolError("tab_not_owned", `no such tab ${tab} in this session`);
+    }
+    session.activeTab = tab;
+    const rec = session.tabs.get(tab);
+    await chrome.tabs.update(rec.chromeTabId, { active: true }).catch(() => {});
+    return text(`Active tab is now ${tab}`);
+  }
+
+  /** Tear down every tab owned by a session (called on MCP session close). */
+  async closeSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    for (const [handle, rec] of [...session.tabs]) {
+      try {
+        await new Promise((r) => chrome.debugger.detach({ tabId: rec.chromeTabId }, () => r()));
+      } catch (e) {}
+      await chrome.tabs.remove(rec.chromeTabId).catch(() => {});
+      this.tabLocks.delete(rec.chromeTabId);
+      this.tabIndex.delete(rec.chromeTabId);
+      session.tabs.delete(handle);
+    }
+    this.sessions.delete(sessionId);
+    this.pushStatus(this.anyAttached(), null, null, "session_closed");
   }
 }

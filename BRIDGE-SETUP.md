@@ -121,6 +121,21 @@ claude mcp list      # 'browser' → ✓ Connected
 - Real run: from the VM ask Claude Code to `check_local_status` then
   `browser_navigate` to a page and `browser_snapshot` — it should drive the Aso tab.
 
+### Multi-tab & multi-agent sessions
+
+Each MCP client (one agent) is an isolated **session** with its own tab group:
+
+- `browser_tab_new` opens a tab and returns a stable **handle** (`t1`, `t2`, …).
+  Pass it as the `tab` arg to `browser_navigate/snapshot/click/type/…`; omit `tab`
+  to target the session's active tab. `browser_tab_select` changes the active tab.
+- The debugger attaches to **many tabs at once** (one *“…debugging this browser”*
+  bar per attached tab is expected). Commands to different tabs run in parallel;
+  same-tab commands are serialized.
+- Sessions are keyed by the MCP `Mcp-Session-Id` (handled by the SDK client — the
+  agent never sets it). A session can only act on tabs it owns; another session's
+  handle is rejected with `tab_not_owned`. When an agent disconnects, its tabs are
+  closed automatically. Header-less callers share a `default` session (back-compat).
+
 ### Keepalive soak test (the make-or-break MV3 risk)
 
 Background/minimize the Aso window, then poll from the VM every ~2 min for hours:

@@ -13,7 +13,9 @@ const MODEL = process.env.MODEL || provider.defaultModel;
 const SYSTEM_PROMPT =
   "You are a browser automation agent with access to a real Chrome browser on the user's local machine. " +
   "Before using any browser tools, call check_local_status (with notify=true on the first call) to confirm the machine is online and Chrome is ready. " +
-  "When navigating, always open a new tab rather than reusing existing ones. After a page navigates or a dialog is dismissed, take a fresh browser_snapshot before clicking, since element references from a previous snapshot may be stale. " +
+  "You can work on multiple pages at once: open a tab with browser_tab_new (it returns a stable handle like 't2') and pass that handle as the `tab` argument to browser_navigate/snapshot/click/type/etc. to drive that specific tab. Omitting `tab` uses the session's active tab. " +
+  "To work in parallel, open several tabs and issue multiple tool calls in a SINGLE turn targeting DIFFERENT tabs — they run concurrently. Keep steps that depend on each other on the SAME tab in separate turns, since same-tab calls in one batch are not ordered. " +
+  "After a page navigates or a dialog is dismissed, take a fresh browser_snapshot of that tab before clicking, since element refs from a previous snapshot are per-tab and go stale. " +
   "Be concise in your responses. Describe what you did and what you found.";
 
 async function main() {

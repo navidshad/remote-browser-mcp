@@ -8,18 +8,23 @@
       }
       body {
         font: 13px/1.45 -apple-system, system-ui, sans-serif;
-        width: 320px;
+        width: 340px;
         margin: 0;
         padding: 14px 16px;
       }
       h1 {
         font-size: 14px;
-        margin: 0 0 10px;
+        margin: 0 0 4px;
+      }
+      .sub {
+        color: #8889;
+        font-size: 11px;
+        margin: 0 0 12px;
       }
       label {
         display: block;
         font-weight: 600;
-        margin: 10px 0 3px;
+        margin: 8px 0 3px;
       }
       input {
         width: 100%;
@@ -28,11 +33,13 @@
         font: inherit;
         border: 1px solid #8884;
         border-radius: 6px;
+        background: transparent;
+        color: inherit;
       }
       .row {
         display: flex;
         gap: 8px;
-        margin-top: 14px;
+        margin-top: 12px;
       }
       button {
         flex: 1;
@@ -49,19 +56,104 @@
         background: #8883;
         color: inherit;
       }
-      #status {
-        margin-top: 14px;
+      button.ghost {
+        flex: 0 0 auto;
+        background: transparent;
+        border: 1px solid #8884;
+        color: inherit;
+        padding: 4px 8px;
+        font-size: 11px;
+      }
+      /* profile list */
+      .profiles {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .profile {
+        border: 1px solid #8883;
+        border-radius: 8px;
         padding: 8px 10px;
-        border-radius: 6px;
-        background: #8881;
+      }
+      .profile .top {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .profile .name {
         font-weight: 600;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .profile .url {
+        color: #8889;
+        font-size: 11px;
+        margin-top: 2px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .profile .state {
+        font-size: 11px;
+        margin-top: 4px;
+        color: #8889;
+      }
+      .actions {
+        display: flex;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .empty {
+        color: #8889;
+        font-size: 12px;
+        padding: 6px 0;
+      }
+      /* toggle switch */
+      .switch {
+        position: relative;
+        width: 34px;
+        height: 20px;
+        flex: 0 0 auto;
+      }
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+        position: absolute;
+      }
+      .slider {
+        position: absolute;
+        inset: 0;
+        background: #8886;
+        border-radius: 20px;
+        transition: 0.15s;
+        cursor: pointer;
+      }
+      .slider::before {
+        content: "";
+        position: absolute;
+        width: 14px;
+        height: 14px;
+        left: 3px;
+        top: 3px;
+        background: #fff;
+        border-radius: 50%;
+        transition: 0.15s;
+      }
+      .switch input:checked + .slider {
+        background: #16a34a;
+      }
+      .switch input:checked + .slider::before {
+        transform: translateX(14px);
       }
       .dot {
         display: inline-block;
         width: 9px;
         height: 9px;
         border-radius: 50%;
-        margin-right: 7px;
+        margin-right: 6px;
         vertical-align: -1px;
         background: #999;
       }
@@ -79,24 +171,64 @@
         font-size: 11px;
         margin-top: 4px;
       }
+      #form {
+        border: 1px solid #8884;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-top: 12px;
+      }
+      #form h2 {
+        font-size: 12px;
+        margin: 0 0 4px;
+      }
+      .hidden {
+        display: none;
+      }
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-weight: 600;
+        margin: 10px 0 0;
+        cursor: pointer;
+      }
+      .check input {
+        width: auto;
+        margin: 0;
+      }
     </style>
   </head>
   <body>
     <h1>Remote Browser Agent</h1>
+    <p class="sub">Each profile is a bridge connection with its own isolated tabs. Toggle one on to connect.</p>
 
-    <label for="url">Agent URL</label>
-    <input id="url" type="text" placeholder="wss://browser-ws.subturtle.app" spellcheck="false" />
-    <div class="hint">The VM bridge WebSocket endpoint (wss://).</div>
-
-    <label for="token">Access Token</label>
-    <input id="token" type="password" placeholder="paste the shared token" spellcheck="false" />
+    <div id="profiles" class="profiles"></div>
 
     <div class="row">
-      <button id="save">Save &amp; Connect</button>
-      <button id="reconnect" class="secondary">Reconnect</button>
+      <button id="add">+ Add profile</button>
+      <button id="reconnect" class="secondary">Reconnect all</button>
     </div>
 
-    <div id="status"><span class="dot"></span><span id="statusText">…</span></div>
+    <div id="form" class="hidden">
+      <h2 id="formTitle">New profile</h2>
+      <label for="name">Name</label>
+      <input id="name" type="text" placeholder="e.g. Prod bridge" spellcheck="false" />
+
+      <label for="url">Agent URL</label>
+      <input id="url" type="text" placeholder="wss://aso-agent.subturtle.app/rbm-ws" spellcheck="false" />
+      <div class="hint">The VM bridge WebSocket endpoint (wss://).</div>
+
+      <label for="token">Access Token</label>
+      <input id="token" type="password" placeholder="paste the shared token" spellcheck="false" />
+
+      <label class="check"><input id="blockInput" type="checkbox" /> Block my input while the agent is acting</label>
+      <div class="hint">Suppresses your mouse/keyboard on this profile's tabs during agent activity, so you can't interfere mid-action.</div>
+
+      <div class="row">
+        <button id="saveProfile">Save</button>
+        <button id="cancel" class="secondary">Cancel</button>
+      </div>
+    </div>
 
     <script src="popup.js"></script>
   </body>
