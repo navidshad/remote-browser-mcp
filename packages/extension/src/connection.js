@@ -29,9 +29,11 @@ export class Connection {
     this.backoff = 0;
     this.connState = "init"; // init | connecting | connected | auth_error | disconnected
     this.closed = false; // set on teardown → stop reconnecting
-    // Each connection owns its Executor → tabs are isolated per profile.
-    this.executor = deps.makeExecutor((attached, tabId, url, reason) =>
-      this.pushStatus(attached, tabId, url, reason)
+    // Each connection owns its Executor → tabs are isolated per profile. The
+    // profile name labels the executor's tab groups.
+    this.executor = deps.makeExecutor(
+      (attached, tabId, url, reason) => this.pushStatus(attached, tabId, url, reason),
+      profile.name || profile.id
     );
   }
 

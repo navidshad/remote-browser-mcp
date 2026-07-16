@@ -10,10 +10,26 @@
 //     detach one tab to drive another, so different tabs run genuinely in parallel.
 //   • Commands to the SAME tab are serialized by a per-chromeTabId promise lock so
 //     overlapping CDP input events don't interleave; different tabs are unaffected.
-import { SNAPSHOT_FN, RESOLVE_BOX_FN, FOCUS_FN, SELECT_ALL_FN } from "./page-scripts.js";
+import { SNAPSHOT_FN, RESOLVE_BOX_FN, FOCUS_FN, SELECT_ALL_FN, OVERLAY_FN, OVERLAY_HIDE_FN } from "./page-scripts.js";
 
 const PROTOCOL = "1.3";
 const DEFAULT_SESSION = "default";
+
+// Per-session identity color, used for BOTH the Chrome tab group and the
+// in-page activity overlay ring, so a human can match tabs to the agent
+// driving them at a glance. Names are chrome.tabGroups colors.
+const SESSION_COLORS = ["blue", "green", "purple", "orange", "pink", "cyan", "red", "yellow"];
+const COLOR_CSS = {
+  blue: "#2563eb",
+  green: "#16a34a",
+  purple: "#9333ea",
+  orange: "#ea580c",
+  pink: "#db2777",
+  cyan: "#0891b2",
+  red: "#dc2626",
+  yellow: "#ca8a04",
+  grey: "#6b7280",
+};
 
 const KEY_MAP = {
   Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
@@ -33,6 +49,28 @@ const KEY_MAP = {
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 
+/** Human-readable overlay caption for an agent command. */
+function actionText(name, a) {
+  switch (name) {
+    case "browser_navigate":
+      return `navigate → ${a.url || ""}`;
+    case "browser_click":
+      return `click: ${a.element || a.ref || ""}`;
+    case "browser_type":
+      return `type into ${a.element || a.ref || ""}`;
+    case "browser_press_key":
+      return `press ${a.key || "key"}`;
+    case "browser_take_screenshot":
+      return "screenshot";
+    case "browser_snapshot":
+      return "reading page";
+    case "browser_wait_for":
+      return a.time != null ? `wait ${a.time}s` : `waiting for "${a.text ?? a.textGone ?? ""}"`;
+    default:
+      return name.replace(/^browser_/, "").replace(/_/g, " ");
+  }
+}
+
 class ToolError extends Error {
   constructor(code, message) {
     super(message);
@@ -41,10 +79,12 @@ class ToolError extends Error {
 }
 
 export class Executor {
-  /** @param {(attached: boolean, tabId: number|null, url: string|null, reason?: string) => void} pushStatus */
-  constructor(pushStatus) {
+  /** @param {(attached: boolean, tabId: number|null, url: string|null, reason?: string) => void} pushStatus
+   *  @param {string} [label] group-title label for this executor's tab groups (e.g. the profile name) */
+  constructor(pushStatus, label) {
     this.pushStatus = pushStatus;
-    // sessionId -> { id, tabs: Map<handle,{chromeTabId,attached,url}>, activeTab, seq }
+    this.label = label || "Agent";
+    // sessionId -> { id, tabs: Map<handle,{chromeTabId,attached,url}>, activeTab, seq, color, groupId }
     this.sessions = new Map();
     // chromeTabId -> { sessionId, handle } — reverse index for events + ownership
     this.tabIndex = new Map();
@@ -57,10 +97,38 @@ export class Executor {
     const id = sessionId || DEFAULT_SESSION;
     let s = this.sessions.get(id);
     if (!s) {
-      s = { id, tabs: new Map(), activeTab: null, seq: 0 };
+      const color = SESSION_COLORS[this.sessions.size % SESSION_COLORS.length];
+      s = { id, tabs: new Map(), activeTab: null, seq: 0, color, groupId: null };
       this.sessions.set(id, s);
     }
     return s;
+  }
+
+  /** Put a tab into the session's Chrome tab group (creating it on first use) so
+   *  each agent's tabs are visually bundled. Best-effort: grouping is cosmetic
+   *  and must never fail a command. */
+  async ensureGrouped(session, chromeTabId) {
+    if (!chrome.tabs.group || !chrome.tabGroups) return;
+    try {
+      if (session.groupId != null) {
+        try {
+          await chrome.tabs.group({ tabIds: [chromeTabId], groupId: session.groupId });
+          return;
+        } catch (e) {
+          session.groupId = null; // group was closed — recreate below
+        }
+      }
+      session.groupId = await chrome.tabs.group({ tabIds: [chromeTabId] });
+      await chrome.tabGroups.update(session.groupId, { title: this.label, color: session.color });
+    } catch (e) {
+      // tab may have closed mid-flight, or grouping unsupported — ignore
+    }
+  }
+
+  /** Flash the in-page activity overlay (ring + action badge) on a tab. Fire-and-
+   *  forget: purely informational for the human watching the window. */
+  showAction(chromeTabId, session, text) {
+    this.evalFn(chromeTabId, OVERLAY_FN, { text, color: COLOR_CSS[session.color] || COLOR_CSS.grey }).catch(() => {});
   }
 
   allocHandle(session) {
@@ -124,6 +192,7 @@ export class Executor {
     const cand = tabs.find((t) => t.active && usable(t)) || tabs.find(usable);
     if (!cand) return null;
     const handle = this.registerTab(session, cand.id, cand.url);
+    await this.ensureGrouped(session, cand.id);
     return { handle, chromeTabId: cand.id };
   }
 
@@ -149,6 +218,7 @@ export class Executor {
     }
     const created = await chrome.tabs.create({ url: "about:blank", active: true });
     const handle = this.registerTab(session, created.id, "about:blank");
+    await this.ensureGrouped(session, created.id);
     return { handle, chromeTabId: created.id };
   }
 
@@ -250,6 +320,12 @@ export class Executor {
     const { handle, chromeTabId } = await this.resolveOwnedTab(session, a.tab);
     return this.withTabLock(chromeTabId, async () => {
       await this.ensureAttached(chromeTabId);
+      if (name === "browser_take_screenshot") {
+        // Hide the overlay first so captures show the page, not our ring/badge.
+        await this.evalFn(chromeTabId, OVERLAY_HIDE_FN).catch(() => {});
+      } else {
+        this.showAction(chromeTabId, session, actionText(name, a));
+      }
       switch (name) {
         case "browser_navigate":
           return this.navigate(session, handle, chromeTabId, a.url, deadlineMs);
@@ -276,6 +352,9 @@ export class Executor {
     if (!url) throw new ToolError("bad_args", "url is required");
     await this.sendCdp(tabId, "Page.navigate", { url });
     await this.waitForLoad(tabId, Math.min(deadlineMs || 30000, 30000));
+    // The navigation wiped the page (and the overlay with it) — re-show it so
+    // the ring stays visible on the freshly loaded document.
+    this.showAction(tabId, session, `navigate → ${url}`);
     const info = await chrome.tabs.get(tabId).catch(() => null);
     const rec = session.tabs.get(handle);
     if (rec && info) rec.url = info.url;
@@ -412,8 +491,10 @@ export class Executor {
   async tabNew(session, url, deadlineMs) {
     const created = await chrome.tabs.create({ url: url || "about:blank", active: true });
     const handle = this.registerTab(session, created.id, url || "about:blank");
+    await this.ensureGrouped(session, created.id);
     await this.withTabLock(created.id, () => this.ensureAttached(created.id));
     if (url) await this.waitForLoad(created.id, Math.min(deadlineMs || 30000, 30000), true);
+    this.showAction(created.id, session, `opened ${handle}${url ? ` → ${url}` : ""}`);
     const info = await chrome.tabs.get(created.id).catch(() => null);
     if (info) session.tabs.get(handle).url = info.url;
     return text(`Opened tab ${handle} — ${info ? info.url : url || "about:blank"}`);

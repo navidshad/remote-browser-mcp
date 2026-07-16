@@ -15,7 +15,7 @@ import { ConnectionManager } from "./connection.js";
 
 const manager = new ConnectionManager({
   WebSocketCtor: WebSocket,
-  makeExecutor: (pushStatus) => new Executor(pushStatus),
+  makeExecutor: (pushStatus, label) => new Executor(pushStatus, label),
   onStateChange: () => {},
   log: (...a) => console.log(...a),
 });

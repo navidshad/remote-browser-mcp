@@ -33,6 +33,7 @@ const tabTotal = (ex) => [...ex.sessions.values()].reduce((n, s) => n + s.tabs.s
 
 // ── mock chrome.* (shared tab store; each Executor tracks only its own tabs) ───
 let nextTabId = 100;
+let nextGroupId = 500;
 const tabs = new Map();
 function makeTab(url) {
   const id = ++nextTabId;
@@ -57,7 +58,9 @@ globalThis.chrome = {
       }
       return Promise.resolve(t);
     },
+    group: async ({ groupId }) => groupId ?? ++nextGroupId,
   },
+  tabGroups: { update: async () => ({}) },
   debugger: {
     attach: (_t, _v, cb) => cb(),
     detach: (_t, cb) => cb(),

@@ -11,6 +11,6 @@
     "default_popup": "popup.html",
     "default_title": "Remote Browser Agent"
   },
-  "permissions": ["debugger", "tabs", "storage", "alarms"],
+  "permissions": ["debugger", "tabs", "tabGroups", "storage", "alarms"],
   "host_permissions": ["<all_urls>"]
 }
