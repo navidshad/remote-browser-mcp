@@ -43,24 +43,25 @@ class AnthropicSession implements LlmSession {
       const toolUses = response.content.filter(
         (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
       );
-      const results: Anthropic.ToolResultBlockParam[] = [];
 
-      for (const tu of toolUses) {
-        printToolStart(tu.name);
-        try {
-          const out = await this.deps.callTool(tu.name, tu.input as Record<string, unknown>);
-          printToolEnd(true);
-          results.push({ type: "tool_result", tool_use_id: tu.id, content: out });
-        } catch (err) {
-          printToolEnd(false, String(err));
-          results.push({
-            type: "tool_result",
-            tool_use_id: tu.id,
-            content: `Error: ${err}`,
-            is_error: true,
-          });
-        }
-      }
+      // Run the batch concurrently — when the model drives several tabs at once,
+      // their tool calls execute in parallel (the extension serializes same-tab
+      // work). Results match by tool_use_id, so order is irrelevant to Anthropic;
+      // Promise.all preserves array order anyway, and each task resolves (never
+      // rejects) to a tool_result block.
+      const results: Anthropic.ToolResultBlockParam[] = await Promise.all(
+        toolUses.map(async (tu): Promise<Anthropic.ToolResultBlockParam> => {
+          printToolStart(tu.name);
+          try {
+            const out = await this.deps.callTool(tu.name, tu.input as Record<string, unknown>);
+            printToolEnd(true);
+            return { type: "tool_result", tool_use_id: tu.id, content: out };
+          } catch (err) {
+            printToolEnd(false, String(err));
+            return { type: "tool_result", tool_use_id: tu.id, content: `Error: ${err}`, is_error: true };
+          }
+        })
+      );
 
       this.messages.push({ role: "assistant", content: response.content });
       this.messages.push({ role: "user", content: results });

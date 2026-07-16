@@ -43,8 +43,46 @@ async function main() {
     (pong as { isError?: boolean }).isError
       ? fail(`bridge_ping returned error: ${text}`)
       : pass(`bridge_ping round-trip ok: "${text}"`);
+
+    // ── multi-tab: open two tabs and drive each independently ────────────────
+    const openA = firstText(await client.callTool({ name: "browser_tab_new", arguments: { url: "https://example.com/" } }));
+    const openB = firstText(await client.callTool({ name: "browser_tab_new", arguments: { url: "https://example.org/" } }));
+    const handleA = openA.match(/\bt\d+\b/)?.[0];
+    const handleB = openB.match(/\bt\d+\b/)?.[0];
+    handleA && handleB && handleA !== handleB
+      ? pass(`two tabs opened with distinct handles (${handleA}, ${handleB})`)
+      : fail(`expected two distinct tab handles, got ${handleA} / ${handleB}`);
+
+    if (handleA && handleB) {
+      const snapA = firstText(await client.callTool({ name: "browser_snapshot", arguments: { tab: handleA } }));
+      const snapB = firstText(await client.callTool({ name: "browser_snapshot", arguments: { tab: handleB } }));
+      snapA.includes("example") || snapB.includes("example")
+        ? pass("independent snapshots returned per tab handle")
+        : fail("snapshots did not return expected per-tab content");
+    }
+
+    // ── isolation: a second MCP client must not see client A's tabs ──────────
+    const clientB = new Client({ name: "bridge-test-client-b", version: "0.1.0" });
+    await clientB.connect(new StreamableHTTPClientTransport(new URL(BRIDGE_URL)));
+    const listB = firstText(await clientB.callTool({ name: "browser_tab_list", arguments: {} }));
+    !listB.includes(handleA ?? "\0") && (listB.includes("no tabs") || listB.trim() === "" || !listB.includes("example.com"))
+      ? pass("second session does not see the first session's tabs")
+      : fail(`isolation leak: client B tab_list shows client A's tabs:\n${listB}`);
+
+    if (handleA) {
+      const cross = await clientB.callTool({ name: "browser_snapshot", arguments: { tab: handleA } });
+      (cross as { isError?: boolean }).isError && /not owned/i.test(firstText(cross))
+        ? pass("cross-session tab handle rejected with tab_not_owned")
+        : fail(`expected tab_not_owned for client B using client A's handle, got: ${firstText(cross)}`);
+    }
+    await clientB.close();
+
+    // Tidy up the test tabs (the SDK client's close() doesn't send the DELETE
+    // that ends the session, so without this they linger until the idle reaper).
+    if (handleA) await client.callTool({ name: "browser_tab_close", arguments: { tab: handleA } });
+    if (handleB) await client.callTool({ name: "browser_tab_close", arguments: { tab: handleB } });
   } else {
-    console.log("\n  (extension not connected — skipping bridge_ping round-trip)");
+    console.log("\n  (extension not connected — skipping multi-tab & isolation round-trips)");
   }
 
   console.log();
