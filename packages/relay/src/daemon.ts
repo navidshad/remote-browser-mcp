@@ -1,43 +1,40 @@
-#!/usr/bin/env node
-// lumi-relay — the thing a browser phones, so an agent has something to call.
-//
-// A browser on somebody's laptop has no address. It sits behind NAT, sleeps, changes networks,
-// and is not a server. So it dials OUT and stays on the line, and this process is what it dials.
-// Crew then addresses a machine it can never reach directly by naming it —
-// `${ownerUid}:${browserId}` — to a box that can.
-//
-// Two faces, ONE port:
-//   • `/ws`    the extension's WebSocket. Authenticated in-band by a Crew-minted ticket, because
-//              a browser WebSocket cannot send headers — which is also why this route has no
-//              Cloudflare Access policy and the ticket is the whole gate.
-//   • `/v1/*`  the control plane Crew calls. Bearer-authenticated with a DIFFERENT secret, and
-//              Access-protected at the edge, because that caller IS a server and can send headers.
-//
-// It holds no Firebase credential and never talks to Firestore. Presence and dispatch, nothing
-// else: whether a given agent may drive a given browser right now is Crew's decision, re-made from
-// live documents on every single call.
+// The long-running half: load config, start the relay, and shut it down without breaking a click.
 
 import { loadConfig } from "./config.js";
-import { startRelay } from "./server.js";
+import { startRelay, type RunningRelay } from "./server.js";
+import { appendLog } from "./logging.js";
 import { RELAY_VERSION } from "./version.js";
+import { loadEnvFileIntoProcess } from "./paths.js";
 
+/**
+ * Log to stdout AND the rotating file.
+ *
+ * Both, not either. Under systemd stdout goes to the journal, which is the right place — but this
+ * relay may end up on a box where the operator's instinct is `tail -f`, and `journalctl --user`
+ * needs a session that `sudo -u` does not give you. One line in two places costs nothing.
+ */
 function log(msg: string): void {
-  console.log(`${new Date().toISOString()} ${msg}`);
+  const line = `${new Date().toISOString()} ${msg}`;
+  console.log(line);
+  appendLog(line);
 }
 
-async function main(): Promise<void> {
+export async function runDaemon(): Promise<RunningRelay> {
+  loadEnvFileIntoProcess();
+
   let config;
   try {
     config = loadConfig();
   } catch (err) {
-    console.error(`FATAL: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`FATAL: ${message}`);
+    appendLog(`FATAL: ${message}`);
     process.exit(1);
-    return;
   }
 
   const relay = await startRelay(config, log);
 
-  log(`lumi-relay ${RELAY_VERSION} (${config.instanceId})`);
+  log(`lumi-relay ${RELAY_VERSION} (${config.instanceId}) — node ${process.version}`);
   log(`  control : http://${config.bindHost}:${relay.port}/v1/*  (bearer required)`);
   log(`  browsers: ws://${config.bindHost}:${relay.port}/ws      (ticket required)`);
   log(`  liveness: http://${config.bindHost}:${relay.port}/health`);
@@ -53,6 +50,9 @@ async function main(): Promise<void> {
   // closed with 1012 "Service Restart", which the extension's existing backoff already treats as
   // temporary — so an upgrade costs a browser a few seconds of reconnect and needs no extension
   // change at all.
+  //
+  // `TimeoutStopSec` in the unit must exceed `RELAY_DRAIN_GRACE_MS`, or systemd SIGKILLs us
+  // mid-drain and the draining was theatre. See service.ts.
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
@@ -66,6 +66,6 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
-}
 
-void main();
+  return relay;
+}

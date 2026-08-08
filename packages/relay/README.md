@@ -54,6 +54,44 @@ The WS route deliberately has **no** Cloudflare Access policy in front of it, be
 which is why every frame after it is schema-validated with bounds — see
 [`src/protocol.ts`](src/protocol.ts).
 
+## Installing it
+
+```bash
+lumi-relay setup            # writes ~/.lumi-relay/relay.env and mints the two keys
+lumi-relay service install  # systemd --user unit (launchd on macOS, for development)
+lumi-relay doctor           # every question worth asking before blaming the relay
+```
+
+`setup` prints the two keys **once**, in the form you paste into Google Secret Manager. It is
+**idempotent on purpose**: running it again keeps the existing keys, because the ticket key is
+shared with Crew and rotating it refuses every connected browser with `unauthorized` — which the
+extension correctly treats as *stop and tell the human*, not as something to retry. Rotation is
+`setup --rotate`, spelled out loud. `config show-keys` prints them again later.
+
+`doctor` has three verdicts and they mean different things: **fail** is broken now, **warn** is
+working now and will break later (no lingering, no fd ceiling), **skip** is not applicable here.
+It exits non-zero only on `fail`, and it fails *open* on anything it could not read — a false
+"your relay is broken" on a healthy box costs more than a missed detection.
+
+`update` is a short ladder on purpose. The Crew runner's self-update is ten rungs because it runs
+on laptops nobody can reach; this runs on one box we can ssh into. What it keeps are the rungs that
+encode a lesson: it updates the thing the **supervisor execs** rather than whatever is on PATH
+(refusing, closed, if it cannot show those are the same), it never believes npm's exit code — the
+version is re-read from disk at that path afterwards — and it restarts through the service manager
+rather than `exec`. Running from a git checkout, it says so and gives you the `git pull` line.
+
+### On the Lightsail box
+
+Port **8788**, not 8787 — `ceo-agent` owns 8787 there. The Cloudflare named tunnel
+(`kilogent-relay`) already routes `relay.kilogent.com` at `http://127.0.0.1:8788`.
+
+```bash
+lumi-relay setup --port 8788 --instance-id lightsail-eu-central-1
+lumi-relay service install
+sudo loginctl enable-linger ubuntu   # or the unit stops when you log out
+lumi-relay doctor
+```
+
 ## Configuration
 
 | Variable | Default | |
@@ -74,11 +112,13 @@ header on every dispatch — over the tunnel, through Cloudflare, into anything 
 The other is a *signing* key: whoever holds it can mint a ticket and connect as somebody else's
 browser. A signing key must never be the thing you put in a header hundreds of times a minute.
 
-```bash
-export RELAY_CONTROL_KEY=$(openssl rand -hex 32)
-export RELAY_TICKET_KEY=$(openssl rand -hex 32)
-node dist/index.js
-```
+They live in `~/.lumi-relay/relay.env` at **0600 inside a 0700 directory**, and the systemd unit
+reads that file with `EnvironmentFile=` rather than carrying the values. That distinction is
+load-bearing: a unit file is world-readable under `~/.config/systemd/user`, and `systemctl show`
+prints its environment to anyone who can ask.
+
+An environment variable always beats the file, so a one-off `RELAY_PORT=9000 lumi-relay start`
+does what it looks like.
 
 ## What health actually measures
 

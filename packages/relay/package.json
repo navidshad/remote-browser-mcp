@@ -3,24 +3,27 @@
   "version": "0.1.0",
   "description": "Lumi Crew browser relay: holds one WebSocket per connected browser and dispatches agent commands to it",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/cli/index.js",
   "bin": {
-    "lumi-relay": "dist/index.js"
+    "lumi-relay": "dist/cli/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "tsx src/cli/index.ts start",
+    "start": "node dist/cli/index.js start",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "dependencies": {
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
