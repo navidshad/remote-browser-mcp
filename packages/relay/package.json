@@ -16,6 +16,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "dev": "tsx src/cli/index.ts start",
     "start": "node dist/cli/index.js start",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
@@ -32,5 +33,29 @@
     "@types/ws": "^8.5.12",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "//prepublishOnly": "dist/ is gitignored and `files` ships only it, so a publish from a fresh checkout that skipped the build would produce a tarball whose `bin` points at a file that is not in it \u2014 installable, and broken on every invocation. This makes that impossible. Runs on `npm publish` only, never on `npm ci`.",
+  "license": "MIT",
+  "author": "CodeBridger",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/navidshad/remote-browser-mcp.git",
+    "directory": "packages/relay"
+  },
+  "bugs": {
+    "url": "https://github.com/navidshad/remote-browser-mcp/issues"
+  },
+  "homepage": "https://github.com/navidshad/remote-browser-mcp/tree/main/packages/relay#readme",
+  "keywords": [
+    "lumi",
+    "lumi-crew",
+    "browser",
+    "relay",
+    "websocket",
+    "mcp",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

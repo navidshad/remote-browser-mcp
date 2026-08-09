@@ -33,7 +33,7 @@ compromise for everybody connected to it. See [`src/ticket.ts`](src/ticket.ts).
 ## The two faces, and the one port
 
 ```
-                    relay.kilogent.com (Cloudflare named tunnel)
+                       your hostname (a Cloudflare named tunnel, say)
                                    │
                     ┌──────────────┴──────────────┐
        Lumi Crew ───┤  POST /v1/dispatch          │   Bearer RELAY_CONTROL_KEY
@@ -80,17 +80,18 @@ encode a lesson: it updates the thing the **supervisor execs** rather than whate
 version is re-read from disk at that path afterwards — and it restarts through the service manager
 rather than `exec`. Running from a git checkout, it says so and gives you the `git pull` line.
 
-### On the Lightsail box
-
-Port **8788**, not 8787 — `ceo-agent` owns 8787 there. The Cloudflare named tunnel
-(`kilogent-relay`) already routes `relay.kilogent.com` at `http://127.0.0.1:8788`.
+On a fresh box, in order:
 
 ```bash
-lumi-relay setup --port 8788 --instance-id lightsail-eu-central-1
+lumi-relay setup --port <port> --instance-id <a-name-for-this-box>
 lumi-relay service install
-sudo loginctl enable-linger ubuntu   # or the unit stops when you log out
+sudo loginctl enable-linger "$USER"   # or the unit stops the moment you log out
 lumi-relay doctor
 ```
+
+Then point something at it — a Cloudflare named tunnel, or whatever terminates TLS in front of the
+loopback port. `doctor` reports whether `cloudflared` is on the box, but not what it is configured
+to do; the tunnel is deliberately outside this package's business.
 
 ## Configuration
 

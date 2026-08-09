@@ -1,0 +1,187 @@
+name: Release relay to npm
+
+# Publishes `@lumi.ai/relay` to the public registry with NO CREDENTIAL — authentication is this
+# job's `id-token: write` plus a trusted publisher registered at
+# npmjs.com -> @lumi.ai/relay -> Settings -> Trusted Publisher
+# (GitHub Actions · navidshad · remote-browser-mcp · release-relay.yml).
+#
+# There is no NPM_TOKEN secret and there must not be one. A long-lived token with publish rights to
+# this scope would be a credential that can also push `@lumi.ai/runner` — which is installed on
+# customers' machines and auto-updates by default. That blast radius is exactly what OIDC removes.
+#
+# ONE FILE IS NOT A STYLE CHOICE. npm allows exactly one trusted publisher per package and matches
+# it on the workflow FILENAME, case-sensitively. Renaming this file breaks publishing until the
+# npmjs.com setting is changed to match, and the failure looks like a permissions error.
+#
+# THE FIRST PUBLISH CANNOT USE THIS. npm only registers a trusted publisher against a package that
+# already EXISTS, so `0.1.0` is published by hand with an OTP and everything after it comes from
+# here. Expect the same one-off for any future new package under this scope.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/relay/**'
+      - '.github/workflows/release-relay.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  # Never cancelled: a half-finished publish is not something to interrupt.
+  group: release-relay-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The entire authentication story, together with the npmjs.com registration above.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          # NO `registry-url`. It looks like the obvious thing to set and it BREAKS OIDC:
+          # setup-node unconditionally writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
+          # into an .npmrc, and with no token in the environment that expands to an EMPTY token.
+          # npm then treats auth as already configured, never starts the OIDC exchange, and dies
+          # with `E404 ... you do not have permission` — which reads exactly like a missing trusted
+          # publisher and is not (actions/setup-node#1551). The tell in the log is
+          # `npm warn Unknown user config "always-auth"`, a line only setup-node's .npmrc adds.
+          # npm publishes to registry.npmjs.org by default, so omitting it costs nothing.
+
+      # npm >= 11.5.1; Node 22 ships npm 10.x, which has no OIDC support at all — without this the
+      # publish looks for an auth token, finds none, and fails with ENEEDAUTH.
+      - name: Upgrade npm for trusted publishing
+        run: npm i -g npm@latest
+
+      - name: Assert no npm auth is configured
+        # OIDC engages only when npm finds NO credentials, so prove that BEFORE publishing. Without
+        # this, a bad trusted-publisher registration and a stray empty token shadowing OIDC produce
+        # an identical error.
+        run: |
+          set -uo pipefail
+          echo "npm $(npm -v), node $(node -v)"
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NODE_AUTH_TOKEN is set. npm will use it instead of OIDC. Remove it."
+            exit 1
+          fi
+          TOKEN_CFG=$(npm config get //registry.npmjs.org/:_authToken 2>/dev/null || echo undefined)
+          echo "configured authToken: ${TOKEN_CFG}"
+          case "$TOKEN_CFG" in
+            undefined|null|'') echo "No token configured — OIDC is free to engage." ;;
+            *) echo "::error::An npm authToken is configured (setup-node's registry-url?). It shadows OIDC."; exit 1 ;;
+          esac
+
+      - name: Install dependencies
+        run: npm ci
+
+      # This repo has no shared CI workflow, so the gate is here. Publishing an untested tarball to
+      # a public registry is worse than not publishing.
+      - name: Typecheck
+        run: npm run typecheck --workspace=packages/relay
+
+      - name: Test
+        run: npm test --workspace=packages/relay
+
+      - name: Build
+        run: npm run build --workspace=packages/relay
+
+      - name: Read the version
+        id: v
+        # The version is whatever `packages/relay/package.json` says. Deliberately NOT derived from
+        # commit history the way `@lumi.ai/runner`'s is: that resolver exists because the runner
+        # ships to strangers on two channels and a missed bump strands them on an old binary. This
+        # has one operator, who is also the person editing the file.
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./packages/relay/package.json').name")
+          VERSION=$(node -p "require('./packages/relay/package.json').version")
+          echo "name=$NAME"       >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved $NAME@$VERSION"
+
+      - name: Skip if this version is already published
+        id: exists
+        # Idempotency. A push to main that touched the relay without bumping the version would
+        # otherwise fail with `403 You cannot publish over the previously published versions` — a
+        # red X for doing nothing wrong. `npm view` exits non-zero for a package that does not
+        # exist at all, so the `|| echo '[]'` is load-bearing on the very first run.
+        run: |
+          set -uo pipefail
+          PUBLISHED=$(npm view "${{ steps.v.outputs.name }}" versions --json 2>/dev/null || echo '[]')
+          FOUND=$(node -e '
+            const wanted = process.argv[1];
+            let list = [];
+            try { list = JSON.parse(process.argv[2]); } catch {}
+            if (!Array.isArray(list)) list = [list];
+            process.stdout.write(list.includes(wanted) ? "yes" : "no");
+          ' "${{ steps.v.outputs.version }}" "$PUBLISHED")
+          echo "found=$FOUND" >> "$GITHUB_OUTPUT"
+          if [ "$FOUND" = "yes" ]; then
+            echo "::notice::${{ steps.v.outputs.name }}@${{ steps.v.outputs.version }} is already published — skipping."
+          fi
+
+      - name: Smoke-test the tarball
+        if: steps.exists.outputs.found == 'no'
+        # The one thing no other test covers: that the PUBLISHED artifact works. Every test in the
+        # suite imports from `src/`, so they stay green with a broken `bin` mapping, a file missing
+        # from `files`, or a `dist` that was never built — and `dist/` is gitignored, which is
+        # precisely how that last one happens. This installs the real tarball outside the repo and
+        # runs the real binary by name.
+        run: |
+          set -euo pipefail
+          TARBALL=$(cd packages/relay && npm pack --silent --pack-destination "$RUNNER_TEMP")
+          echo "Packed $TARBALL"
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke"
+          npm init -y >/dev/null
+          npm i --no-audit --no-fund "$RUNNER_TEMP/$TARBALL"
+          OUT=$(./node_modules/.bin/lumi-relay --version)
+          echo "lumi-relay --version -> $OUT"
+          [ "$OUT" = "${{ steps.v.outputs.version }}" ] || {
+            echo "::error::binary reports '$OUT' but the release is '${{ steps.v.outputs.version }}'"
+            exit 1
+          }
+          ./node_modules/.bin/lumi-relay --help > /dev/null
+          # It must also REFUSE to start without keys rather than come up unconfigured.
+          if ./node_modules/.bin/lumi-relay start 2>/dev/null; then
+            echo "::error::the relay started with no keys configured"
+            exit 1
+          fi
+          echo "Tarball smoke test passed."
+
+      - name: Publish
+        if: steps.exists.outputs.found == 'no'
+        # No `env:` and no secret. Provenance is left ON — unlike `@lumi.ai/runner`, which must pass
+        # `--no-provenance` because npm can only attest a build from a PUBLIC source repo and
+        # `codebridger/lumi` is private. This repo is public, so every tarball gets a signed
+        # attestation tying it to this commit and this workflow, which is worth having for a package
+        # that ends up running with a browser's credentials behind it.
+        run: npm publish -w packages/relay
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### \`${{ steps.v.outputs.name }}\`"
+            echo ""
+            if [ "${{ steps.exists.outputs.found }}" = "yes" ]; then
+              echo "Skipped — \`${{ steps.v.outputs.version }}\` is already on the registry."
+            else
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Version | \`${{ steps.v.outputs.version }}\` |"
+              echo "| Commit | \`${{ github.sha }}\` |"
+              echo ""
+              echo '```bash'
+              echo "npm i -g ${{ steps.v.outputs.name }}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

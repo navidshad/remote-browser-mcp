@@ -184,9 +184,9 @@ describe("the update ladder", () => {
 
   it("refuses to npm-install over a working copy, and says what to do instead", () => {
     const decision = planUpdate({
-      runningCli: "/opt/kilogent/relay/packages/relay/dist/cli/index.js",
+      runningCli: "/srv/relay/packages/relay/dist/cli/index.js",
       serviceInstalled: true,
-      serviceExec: "/opt/kilogent/relay/packages/relay/dist/cli/index.js",
+      serviceExec: "/srv/relay/packages/relay/dist/cli/index.js",
     });
     assert.equal(decision.action, "refuse");
     assert.match(decision.action === "refuse" ? decision.fix : "", /git pull/);
@@ -198,7 +198,7 @@ describe("the update ladder", () => {
     const decision = planUpdate({
       runningCli: globalCli,
       serviceInstalled: true,
-      serviceExec: "/opt/kilogent/relay/packages/relay/dist/cli/index.js",
+      serviceExec: "/srv/relay/packages/relay/dist/cli/index.js",
     });
     assert.equal(decision.action, "refuse");
     assert.match(decision.action === "refuse" ? decision.reason : "", /not the installed package/);
