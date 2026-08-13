@@ -6,6 +6,14 @@
   "workspaces": [
     "packages/*"
   ],
+  "//privateNames": "Names this repo must never publish. A FORK REMOVES ITS OWN and inherits scripts/check-no-private-detail.mjs unchanged. Trailing * = prefix.",
+  "privateNames": [
+    "subturtle",
+    "kilogent",
+    "lumi",
+    "aso*",
+    "ceo-tunnel"
+  ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "dev:agent": "npm run dev --workspace=packages/agent",
