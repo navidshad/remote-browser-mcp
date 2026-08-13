@@ -15,10 +15,8 @@
  * A doc rule would not have held — the whole point is that nobody re-reads a runbook asking "is this
  * still mine to publish". So it is a test.
  *
- * ALLOWED is empty on purpose. It once held the `@lumi.ai/relay` rename strings, because installed
- * boxes still read the old config directory — that compatibility path is gone now, and so is the
- * exemption. Anything added back here needs a reason written beside it, because an allow-list is
- * where a real leak hides.
+ * ALLOWED is empty on purpose. Anything added there needs a reason written beside it, because an
+ * allow-list is where a real leak hides.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -27,35 +25,23 @@ import { readFileSync } from 'node:fs';
 const ALLOWED = [];
 
 /**
- * WHOSE NAMES THESE ARE is configuration, not code — `privateNames` in package.json, exactly as
- * `releasePackages` decides what a repo publishes.
+ * Things that belong to whoever runs this, not to whoever reads it.
  *
- * A FORK IS WHY. `kilogent` is a private product name in THIS repo and the product's own name in
- * the fork, where 27 tracked files carry it legitimately. Hard-coding the list here would have
- * forced the fork to diverge on this file permanently — and a guard you must edit to merge is a
- * guard that gets edited carelessly, on the one file where carelessness leaks somebody's
- * infrastructure. A fork drops its own name from the DATA and inherits the checker unchanged.
+ * ONLY REAL INFRASTRUCTURE. Product names were in here too — `kilogent`, `lumi` — on the reasoning
+ * that seeing one would mean fork code had leaked in. That is a tidiness check wearing a security
+ * check's clothes, and it cost the fork its entire test lane: 27 tracked files carry its own name
+ * legitimately. It also bought a configuration mechanism whose only purpose was to undo itself.
+ * A hostname and an IP are somebody's machines. A brand is a word.
  *
- * Structural patterns are NOT configurable and stay below: a bare IP and a UUID are somebody's
- * infrastructure in any repo, under any branding.
- *
- * Entries are matched case-insensitively on a word boundary. A trailing `*` means PREFIX — `aso*`
- * catches `aso-dara`, `aso dara`, `aso-agent`, `aso-window` and `ASO_PROFILE_NAME`, which is five
- * separate patterns before, and the reason the old fixed-compound version missed two of them.
+ * Written as patterns rather than one deployment's values, so it keeps working for the next
+ * person's hostnames. `aso` matches as a PREFIX: `aso-dara`, `aso dara`, `aso-agent`, `aso-window`
+ * and `ASO_PROFILE_NAME` are one rule, and the last two are exactly what a fixed-compound version
+ * missed, in tracked files, through the commit whose purpose was removing them.
  */
-const DEFAULT_PRIVATE_NAMES = ['subturtle', 'kilogent', 'lumi', 'aso*', 'ceo-tunnel'];
-
-const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-const privateNames = Array.isArray(pkg.privateNames) ? pkg.privateNames : DEFAULT_PRIVATE_NAMES;
-
-const escape = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const namePattern = (entry) =>
-  entry.endsWith('*')
-    ? new RegExp(`\\b${escape(entry.slice(0, -1))}[-_ ]?[a-z0-9]`, 'i')
-    : new RegExp(`\\b${escape(entry)}\\b`, 'i');
-
 const FORBIDDEN = [
-  ...privateNames.map((n) => [namePattern(n), `a private name (\`${n}\` in package.json privateNames)`]),
+  [/\bsubturtle\b/i, 'a private product hostname'],
+  [/\baso[-_ ]?[a-z0-9]/i, 'a private profile or hostname'],
+  [/\bceo-tunnel\b/i, 'a private pm2 process name'],
   [/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/, 'a bare IP address'],
   [/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i, 'a UUID (tunnel or account id)'],
 ];
@@ -70,9 +56,6 @@ const EXEMPT_FILES = [
 
 /** Loopback and documentation ranges are addresses anyone may write down. */
 const SAFE_IP = /^(127\.|0\.0\.0\.0|255\.|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|1\.2\.3\.4)/;
-
-/** The `privateNames` rows themselves, as they appear in the file, so they can be skipped there. */
-const declaredEntries = new Set(privateNames.map((n) => JSON.stringify(n)));
 
 const files = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
   .split('\n')
@@ -91,10 +74,6 @@ for (const file of files) {
   }
   body.split('\n').forEach((line, i) => {
     if (ALLOWED.some((a) => line.includes(a))) return;
-    // The declaration names the names, exactly as this script used to. Skip the ARRAY ELEMENTS
-    // only — not the whole of package.json, which would let a real hostname hide in a dependency
-    // URL or a repository field two lines away.
-    if (file === 'package.json' && declaredEntries.has(line.trim().replace(/,$/, ''))) return;
     for (const [pattern, what] of FORBIDDEN) {
       const hit = line.match(pattern);
       if (!hit) continue;
@@ -110,8 +89,7 @@ if (failures > 0) {
   console.error(
     `\n❌ private detail: ${failures} line(s) name somebody's real infrastructure.\n` +
       `   Replace with a placeholder (<bridge-host>, <vm-user>@<vm-host>).\n` +
-      `   If this name is YOURS — you are a fork and it is your product — remove it from\n` +
-      `   "privateNames" in package.json rather than editing this file.`,
+      `   If it is genuinely publishable, add the exact string to ALLOWED and say why.`,
   );
   process.exit(1);
 }
