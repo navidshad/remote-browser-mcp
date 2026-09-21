@@ -38,7 +38,22 @@ export function stateFor(pkg, { relayResult, relayPublished }) {
   return '**published to npm**';
 }
 
-export function renderNotes(resolved, outcome) {
+/**
+ * Where the notes point a reader at the extension: one zip, or one per build that
+ * `extensionVariants` declares (see package-extension.mjs). `builds` is `[{id, name}]` or null.
+ */
+export function extensionLine(builds) {
+  if (!builds || builds.length === 0) {
+    return 'The extension is attached below — unzip it and load it unpacked at `chrome://extensions`.';
+  }
+  const list = builds.map((b) => '**' + b.id + '** (' + b.name + ')').join(', ');
+  return (
+    'The extension is attached below as ' + builds.length + ' builds: ' + list + '. ' +
+    'Unzip the one you need and load it unpacked at `chrome://extensions`.'
+  );
+}
+
+export function renderNotes(resolved, outcome, builds = null) {
   const lines = ['| Package | Version | This release |', '|---|---|---|'];
   for (const p of resolved.packages) {
     // Backticks around the version are built by CONCATENATION, never a template literal. That is
@@ -51,7 +66,7 @@ export function renderNotes(resolved, outcome) {
     'npm i -g remote-browser-relay',
     '```',
     '',
-    'The extension is attached below — unzip it and load it unpacked at `chrome://extensions`.',
+    extensionLine(builds),
   );
   for (const p of resolved.packages) {
     if (!p.release || p.commits.length === 0) continue;
@@ -99,6 +114,14 @@ function selfTest() {
   // The failure that shipped: a backslash reaching the output means the escaping is wrong again.
   eq('no stray backslashes survive into the body', body.includes('\\'), false);
 
+  eq('one build keeps the line releases always had', body.includes(
+       'The extension is attached below — unzip it and load it unpacked at `chrome://extensions`.'), true);
+  const builds = [{ id: 'dev', name: 'Acme (Dev)' }, { id: 'prod', name: 'Acme' }];
+  const multi = renderNotes({ packages: [ext] }, {}, builds);
+  eq('several builds are each named, with the id their zip carries',
+     multi.includes('attached below as 2 builds: **dev** (Acme (Dev)), **prod** (Acme).'), true);
+  eq('and the single-build sentence is gone', multi.includes('unzip it and load'), false);
+
   let failed = 0;
   for (const [name, ok, actual, expected] of cases) {
     if (!ok) failed++;
@@ -118,10 +141,21 @@ if (RUN_DIRECTLY && process.argv.includes('--self-test')) {
   selfTest();
 } else if (RUN_DIRECTLY) {
   const resolved = JSON.parse(process.env.RESOLVED ?? '{"packages":[]}');
+  // The same declaration the packager built from, so the notes cannot name a build that is not
+  // attached. Read here rather than passed in: the workflow stays free of inline JS.
+  const { readVariants, mergeManifest } = await import('./package-extension.mjs');
+  const { readFileSync } = await import('node:fs');
+  const variants = readVariants(JSON.parse(readFileSync('package.json', 'utf8')));
+  const manifest = JSON.parse(readFileSync('packages/extension/manifest.json', 'utf8'));
+  const builds = variants?.map((v) => ({ id: v.id, name: mergeManifest(manifest, v.manifest).name })) ?? null;
   process.stdout.write(
-    renderNotes(resolved, {
-      relayResult: process.env.RELAY_RESULT ?? 'skipped',
-      relayPublished: process.env.RELAY_PUBLISHED ?? '',
-    }),
+    renderNotes(
+      resolved,
+      {
+        relayResult: process.env.RELAY_RESULT ?? 'skipped',
+        relayPublished: process.env.RELAY_PUBLISHED ?? '',
+      },
+      builds,
+    ),
   );
 }

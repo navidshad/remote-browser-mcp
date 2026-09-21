@@ -65,6 +65,7 @@ jobs:
           npm run test:registry
           npm run test:guard
           npm run test:popup
+          npm run test:package
 
       - name: Bridge server type-checks
         run: npm run test:bridge
@@ -82,19 +83,21 @@ jobs:
 
       - name: Package the extension
         # A loadable zip on every PR: what you hand somebody to sideload, and what a Web Store
-        # upload takes. The Release attaches its own; this one is for reviewing a change.
+        # upload takes. The Release attaches its own; this one is for reviewing a change. Built by
+        # the SAME script as the Release — one zip, or one per declared build — so what a reviewer
+        # sideloads is laid out exactly like what ships.
         id: zip
         run: |
           set -euo pipefail
+          node scripts/package-extension.mjs --out "$RUNNER_TEMP/dist"
           V=$(node -p "require('./packages/extension/manifest.json').version")
-          zip -qr "$RUNNER_TEMP/extension-$V.zip" packages/extension -x '*/node_modules/*' '*.DS_Store'
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          ls -lh "$RUNNER_TEMP/extension-$V.zip"
+          ls -lh "$RUNNER_TEMP/dist"
 
       - uses: actions/upload-artifact@v5
         with:
           name: extension-${{ steps.zip.outputs.version }}
-          path: ${{ runner.temp }}/extension-${{ steps.zip.outputs.version }}.zip
+          path: ${{ runner.temp }}/dist/
           if-no-files-found: error
 
   relay:

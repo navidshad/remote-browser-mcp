@@ -240,7 +240,7 @@ the coordination:
 
 ```
 resolve  ──┬──▶ relay      (npm, only if packages/relay changed)
-           ├──▶ extension  (stamp + zip, always)
+           ├──▶ extension  (stamp + zip per build, always)
            └──────────────▶ publish  (one GitHub Release, from both outcomes)
 ```
 
@@ -248,6 +248,32 @@ resolve  ──┬──▶ relay      (npm, only if packages/relay changed)
 being built and released — the release says so instead, in the table. Anything other than an
 outright success is reported as not published, because a release naming a version npm does not
 have is worse than a red build.
+
+### Release variants — more than one build from one tree
+
+A fork that runs a development and a production backend needs the same extension twice: pointed at
+two endpoints, installed side by side under two names. Two branches that differ in one file would
+conflict at every merge, and a fork must not edit `release.yml`, which it inherits byte for byte.
+So the builds are **declared** in the root `package.json`:
+
+```json
+"extensionVariants": [
+  { "id": "dev",  "manifest": { "name": "Acme Browser (Dev)" },
+                  "env": { "endpoint": "https://dev.example.com" } },
+  { "id": "prod", "env": { "endpoint": "https://example.com" } }
+]
+```
+
+| | What happens |
+|---|---|
+| No `extensionVariants` | One zip, `extension-<version>.zip` — exactly what this repository ships. |
+| `manifest` | Deep-merged into that build's copy of `manifest.json`. `version` is refused: the release stamps it. |
+| `env` | Written into that build's copy of `packages/extension/src/build-env.js` as `BUILD_ENV`. The committed file is empty, so a checkout falls back to your own defaults. |
+| Each build | Its own zip, `extension-<version>-<id>.zip`, attached to the same release. |
+
+An unknown key, a bad id or a duplicate one fails `npm test` (`test:package` validates your own
+declaration), because ignoring a typo would ship the default build under the variant's name. Try it
+locally with `node scripts/package-extension.mjs --out /tmp/zips`.
 
 ### Versions are derived, never typed
 

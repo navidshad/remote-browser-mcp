@@ -185,16 +185,20 @@ jobs:
         id: zip
         # ALWAYS, even when the extension did not change — the latest release must always be a
         # place somebody can download a working extension from.
+        #
+        # One zip, or one per build the root package.json declares under `extensionVariants` — a
+        # fork with a dev and a prod backend ships both from one tree without editing this file.
+        # The script also writes `assets.txt` (`file#label` per line) for the publish job.
         run: |
           set -euo pipefail
+          node scripts/package-extension.mjs --out "$RUNNER_TEMP/dist"
           V=$(node -p "require('./packages/extension/manifest.json').version")
-          (cd packages/extension && zip -qr "$RUNNER_TEMP/extension-$V.zip" . -x '*/node_modules/*' '*.DS_Store')
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          ls -lh "$RUNNER_TEMP/extension-$V.zip"
+          ls -lh "$RUNNER_TEMP/dist"
       - uses: actions/upload-artifact@v5
         with:
           name: extension-${{ steps.zip.outputs.version }}
-          path: ${{ runner.temp }}/extension-${{ steps.zip.outputs.version }}.zip
+          path: ${{ runner.temp }}/dist/
           if-no-files-found: error
 
   # ── one release, from both outcomes ────────────────────────────────────────────────────────
@@ -241,11 +245,22 @@ jobs:
           node scripts/release-notes.mjs > "$RUNNER_TEMP/notes.md"
           cat "$RUNNER_TEMP/notes.md"
 
+          # One asset per build, `file#label`, exactly as the packager listed them. Plain bash, not
+          # inline JS — see the note above release-notes.mjs.
+          ASSETS=()
+          while IFS= read -r line; do
+            [ -n "$line" ] && ASSETS+=("$RUNNER_TEMP/dist/$line")
+          done < "$RUNNER_TEMP/dist/assets.txt"
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::assets.txt lists no extension builds — refusing to cut a release with nothing to download."
+            exit 1
+          fi
+
           gh release create "$TAG" \
             --title "Extension $EXT · Relay $RELAY_V" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             --target "$GITHUB_SHA" \
-            "$RUNNER_TEMP/dist/extension-$EXT.zip#Chrome extension (unpacked, v$EXT)"
+            "${ASSETS[@]}"
           echo "::notice::Released $TAG"
       - name: Tag the extension
         # AFTER the release succeeded, never before: this tag IS the extension's boundary for the
