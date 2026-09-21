@@ -58,6 +58,19 @@ const KEY_MAP = {
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 
+/** Every command that runs against one owned tab — `execute`'s switch, named once up front so an
+ *  unknown command is refused before any tab is resolved (or opened). Keep the two in step. */
+const TAB_COMMANDS = new Set([
+  "browser_navigate",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_select_option",
+  "browser_press_key",
+  "browser_take_screenshot",
+  "browser_wait_for",
+]);
+
 /** Human-readable overlay caption for an agent command. */
 function actionText(name, a) {
   switch (name) {
@@ -252,12 +265,20 @@ export class Executor {
   // opened, and while it existed, "agents can only see tabs they opened" was false. A sentence a
   // product makes to somebody about their own logged-in Chrome has to be true without an asterisk.
   //
-  // What replaces it is the branch below: a session with no tab OPENS one. Slightly more work for
-  // an agent, and an invariant instead of a footnote.
+  // What replaces it is the branch below: a session with no tab OPENS one — but only to NAVIGATE.
+  // Slightly more work for an agent, and an invariant instead of a footnote.
+  //
+  // IT USED TO OPEN ONE FOR ANY COMMAND, and a fresh tab is `about:blank`. A snapshot or a screenshot
+  // in a session that had never navigated therefore read, or photographed, an empty page — and
+  // reported success. That happened for real: an agent whose earlier run had opened a site took a
+  // "screenshot of it" in a new session, got a uniformly blank frame back, and said it was done.
+  // Nothing about the result looked like an error. Only a navigation has anywhere to go, so only a
+  // navigation may open the tab; everything else is told there is no page yet.
 
-  /** Resolve args.tab (or the session's active tab) to an owned chrome tab. Opens a
-   *  fresh tab if the session has none yet. Throws if the handle isn't owned. */
-  async resolveOwnedTab(session, tab) {
+  /** Resolve args.tab (or the session's active tab) to an owned chrome tab. With `open` (a
+   *  navigation), opens a fresh tab if the session has none yet; otherwise refuses with `no_tab`.
+   *  Throws if the handle isn't owned. */
+  async resolveOwnedTab(session, tab, { open = true } = {}) {
     if (tab != null) {
       const rec = session.tabs.get(tab);
       if (!rec) {
@@ -270,6 +291,13 @@ export class Executor {
     }
     if (session.activeTab && session.tabs.has(session.activeTab)) {
       return { handle: session.activeTab, chromeTabId: session.tabs.get(session.activeTab).chromeTabId };
+    }
+    if (!open) {
+      throw new ToolError(
+        "no_tab",
+        "No page is open in this session, so there is nothing to read or act on — a new tab would " +
+          "only be blank. Open a page first: browser_navigate to a URL, or browser_tab_new."
+      );
     }
     // Every session opens its own tab, including the default one. See the note above.
     const created = await chrome.tabs.create({ url: "about:blank", active: true });
@@ -406,8 +434,15 @@ export class Executor {
     if (name === "browser_tab_close") return this.tabClose(session, a.tab);
     if (name === "browser_tab_select") return this.tabSelect(session, a.tab);
 
-    // Action commands run against one owned tab, serialized per tab.
-    const { handle, chromeTabId } = await this.resolveOwnedTab(session, a.tab);
+    // Refused by NAME before any tab is resolved: an unknown command must never open a tab, and must
+    // be reported as unknown rather than as "no page" in a session that happens to have none.
+    if (!TAB_COMMANDS.has(name)) throw new ToolError("unknown_tool", `unknown tool: ${name}`);
+
+    // Action commands run against one owned tab, serialized per tab. Only a navigation may open it —
+    // see `resolveOwnedTab`.
+    const { handle, chromeTabId } = await this.resolveOwnedTab(session, a.tab, {
+      open: name === "browser_navigate",
+    });
     return this.withTabLock(chromeTabId, async () => {
       await this.ensureAttached(chromeTabId);
       if (name === "browser_take_screenshot") {

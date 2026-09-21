@@ -193,5 +193,39 @@ clickLandsOn = `${ALLOWED}/other`;
   ok(order[0] === 'armed', 'onAttached is AWAITED before a command proceeds, never raced');
 }
 
+// ── a session with no page ─────────────────────────────────────────────────────────────────────
+// A fresh session used to OPEN a tab for any command — and a fresh tab is about:blank, so a
+// screenshot or a snapshot in a session that had never navigated came back blank and "succeeded".
+// An agent did exactly that for real, and reported a uniformly blank screenshot as done.
+clickLandsOn = null;
+{
+  const ex = new Executor(() => {}, 'T', undefined);
+  const before = tabs.size;
+  for (const name of ['browser_take_screenshot', 'browser_snapshot', 'browser_click']) {
+    let err = null;
+    try {
+      await ex.execute(name, { ref: 'e1', element: 'a link' }, 5000, 'empty');
+    } catch (e) {
+      err = e;
+    }
+    ok(err?.code === 'no_tab', `${name} in a session with no page is refused with \`no_tab\``);
+  }
+  ok(tabs.size === before, 'and not one tab was opened doing it — there is no blank page to photograph');
+
+  let unknown = null;
+  try {
+    await ex.execute('browser_teleport', {}, 5000, 'empty');
+  } catch (e) {
+    unknown = e;
+  }
+  ok(unknown?.code === 'unknown_tool', 'an unknown command is still reported as unknown, not as "no page"');
+  ok(tabs.size === before, 'and it opens nothing either');
+
+  const nav = await ex.execute('browser_navigate', { url: ALLOWED }, 5000, 'empty');
+  ok(!!nav && tabs.size === before + 1, 'a NAVIGATION is what opens the tab — exactly one');
+  const shot = await ex.execute('browser_take_screenshot', {}, 5000, 'empty');
+  ok(shot?.content?.[0]?.type === 'image', 'after which a screenshot works, on the page it navigated to');
+}
+
 console.log(failures === 0 ? '\n✅ navigation guard passed' : `\n❌ ${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);
