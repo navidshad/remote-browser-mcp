@@ -293,10 +293,14 @@ export class Executor {
       return { handle: session.activeTab, chromeTabId: session.tabs.get(session.activeTab).chromeTabId };
     }
     if (!open) {
+      // NO COMMAND NAMES in this sentence. It reaches the model word for word through every
+      // transport, and not every client exposes this executor's vocabulary: Kilogent folds it into
+      // `browser_open` / `browser_read` / `browser_act`, so "call browser_navigate" named a tool its
+      // agents do not have. "Navigate to a URL" is true under every vocabulary.
       throw new ToolError(
         "no_tab",
         "No page is open in this session, so there is nothing to read or act on — a new tab would " +
-          "only be blank. Open a page first: browser_navigate to a URL, or browser_tab_new."
+          "only be blank. Navigate to a URL first, then try again."
       );
     }
     // Every session opens its own tab, including the default one. See the note above.

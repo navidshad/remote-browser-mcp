@@ -209,6 +209,9 @@ clickLandsOn = null;
       err = e;
     }
     ok(err?.code === 'no_tab', `${name} in a session with no page is refused with \`no_tab\``);
+    // The sentence reaches the model verbatim through every transport, and each client names the
+    // navigation tool differently — so it must not name a command at all.
+    ok(!/browser_/.test(err?.message ?? 'browser_'), `${name}'s refusal names no command a client may not have`);
   }
   ok(tabs.size === before, 'and not one tab was opened doing it — there is no blank page to photograph');
 
