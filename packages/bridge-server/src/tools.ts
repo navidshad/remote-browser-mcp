@@ -81,7 +81,10 @@ export const BROWSER_TOOLS: BridgeTool[] = [
       slowly: z
         .boolean()
         .optional()
-        .describe("Type one key at a time (fires per-key handlers) instead of inserting at once"),
+        .describe(
+          "Type every key, however long the text. By default typing is keystrokes too, but text " +
+            "past about 15 seconds of typing is inserted at once to stay inside the deadline"
+        ),
       append: z
         .boolean()
         .optional()
@@ -108,8 +111,14 @@ export const BROWSER_TOOLS: BridgeTool[] = [
   },
   {
     name: "browser_press_key",
-    description: "Press a single key (e.g. Enter, Tab, Escape, ArrowDown) on the focused element of a tab.",
-    schema: { key: z.string().describe("Key name, e.g. 'Enter', 'Tab', 'ArrowDown'"), ...tabArg },
+    description:
+      "Press a key or shortcut on the focused element of a tab: a key name (Enter, Tab, Escape, " +
+      "ArrowDown, F5, a), or modifiers joined with '+' (Shift+Tab, Control+a). 'Mod' is the " +
+      "platform's command key — ⌘ on a Mac, Ctrl elsewhere — so 'Mod+a' selects all on both.",
+    schema: {
+      key: z.string().describe("Key or shortcut, e.g. 'Enter', 'ArrowDown', 'Shift+Tab', 'Mod+a'"),
+      ...tabArg,
+    },
     timeoutMs: 15_000,
   },
   {

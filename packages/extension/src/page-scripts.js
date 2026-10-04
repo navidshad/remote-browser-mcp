@@ -442,6 +442,11 @@ export const SELECT_OPTION_FN = function (arg) {
   // A disabled option is usually the "Choose one…" placeholder. Selecting it would be a no-op the
   // page then rejects on submit, so say so rather than reporting a choice that did not happen.
   if (hit.off) return { found: true, matched: false, optionDisabled: hit.label || hit.value, options: names };
+  // MATCH ONLY: the executor first tries to choose with the KEYBOARD (trusted events, like a
+  // person), and comes back here without `matchOnly` only if that could not reach the option.
+  if (arg.matchOnly) {
+    return { found: true, matched: true, index: hit.i, current: el.selectedIndex, label: hit.label || hit.value, value: hit.value };
+  }
 
   try {
     el.scrollIntoView({ block: "center" });
@@ -493,4 +498,69 @@ export const SELECT_ALL_FN = function (ref) {
   } catch (e) {
     return { found: true, empty: false };
   }
+};
+
+/** Where a <select> stands now — read after each keyboard step while choosing. */
+export const SELECT_STATE_FN = function (ref) {
+  const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
+  if (!el || el.tagName !== "SELECT") return { found: false };
+  return { found: true, index: el.selectedIndex };
+};
+
+/** Whether an editable ref already holds text, so the executor knows to select it away first. */
+export const FIELD_STATE_FN = function (ref) {
+  const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
+  if (!el) return { found: false };
+  const v = "value" in el && typeof el.value === "string" ? el.value : el.textContent || "";
+  return { found: true, empty: v.length === 0 };
+};
+
+/** Did the keyboard select-all (⌘A / Ctrl+A) select the WHOLE field? If not — a page that binds
+ *  the shortcut to something else — the executor falls back to `SELECT_ALL_FN`. */
+export const ALL_SELECTED_FN = function (ref) {
+  const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
+  if (!el) return false;
+  try {
+    if ("value" in el && typeof el.selectionStart === "number") {
+      return el.selectionStart === 0 && el.selectionEnd === el.value.length;
+    }
+    const sel = window.getSelection();
+    const want = (el.textContent || "").replace(/\s+/g, "");
+    return !!sel && sel.toString().replace(/\s+/g, "") === want;
+  } catch (e) {
+    return false;
+  }
+};
+
+/** Put the caret at the end of a ref (append mode — the click that focused it may have landed
+ *  mid-text). */
+export const CARET_END_FN = function (ref) {
+  const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
+  if (!el) return false;
+  try {
+    if ("value" in el && typeof el.setSelectionRange === "function") {
+      el.setSelectionRange(el.value.length, el.value.length);
+      return true;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+
+/** The document's scroll position and size, for a full-page capture taken by scrolling. */
+export const SCROLL_STATE_FN = function () {
+  const d = document.scrollingElement || document.documentElement;
+  return {
+    y: window.scrollY,
+    vh: window.innerHeight,
+    vw: window.innerWidth,
+    h: Math.max(d ? d.scrollHeight : 0, document.body ? document.body.scrollHeight : 0),
+  };
 };

@@ -18,6 +18,10 @@ const sent = [];
 let box = { found: true, x: 0, y: 0, left: 0, top: 0, w: 120, h: 40, vw: 1000, vh: 700 };
 let scrolled = 0; // page scroll offset the mock applies to `box` on wheel events
 const WORLD_CTX = 77;
+// A mock <select>: arrow keys move it, as a closed native one does off a Mac.
+let sel = { index: 0, target: 3 };
+// A mock document for full-page captures: 2400 px tall, 700 px viewport.
+let doc = { y: 0, vh: 700, vw: 1000, h: 2400 };
 
 globalThis.chrome = {
   runtime: { lastError: undefined },
@@ -36,9 +40,26 @@ globalThis.chrome = {
       sent.push({ method, params });
       if (method === 'Page.getFrameTree') return cb({ frameTree: { frame: { id: 'F1' } } });
       if (method === 'Page.createIsolatedWorld') return cb({ executionContextId: WORLD_CTX });
-      if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseWheel') scrolled += params.deltaY;
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseWheel') {
+        scrolled += params.deltaY;
+        doc.y = Math.min(Math.max(doc.y + params.deltaY, 0), doc.h - doc.vh);
+      }
+      if (method === 'Input.dispatchKeyEvent' && params.type === 'rawKeyDown') {
+        if (params.key === 'ArrowDown') sel.index++;
+        if (params.key === 'ArrowUp') sel.index--;
+      }
+      if (method === 'Page.captureScreenshot') return cb({ data: `FRAME@${doc.y}` });
       if (method === 'Runtime.evaluate') {
         const e = params.expression;
+        if (e.includes('"matchOnly":true')) {
+          return cb({ result: { value: { found: true, matched: true, index: sel.target, current: sel.index, label: 'Green', value: 'g' } } });
+        }
+        if (e.includes('el.options') && e.includes('dispatchEvent')) {
+          sel.scripted = true;
+          return cb({ result: { value: { found: true, matched: true, label: 'Green', value: 'g' } } });
+        }
+        if (e.includes('scrollingElement')) return cb({ result: { value: { ...doc } } });
+        if (e.includes('selectedIndex') && !e.includes('options')) return cb({ result: { value: { found: true, index: sel.index } } });
         if (e.includes('document.readyState')) return cb({ result: { value: { ready: 'complete', href: 'https://example.com' } } });
         if (e.includes('innerWidth')) {
           const top = box.top - scrolled;
@@ -103,6 +124,108 @@ const wheels = sent.filter((c) => c.method === 'Input.dispatchMouseEvent' && c.p
 ok(wheels.length >= 15, `an element below the fold is reached by wheel ticks (${wheels.length})`);
 ok(wheels.every((w) => Math.abs(w.params.deltaY) <= 100), 'each tick is one notch, not one giant jump');
 ok(!sent.some((c) => c.method === 'Runtime.evaluate' && c.params.expression.includes('scrollIntoView')), 'no scrollIntoView when the wheel works');
+
+console.log('keyboard:');
+{
+  const { IS_MAC } = await import('../packages/extension/src/human.js');
+  sent.length = 0;
+  box = { ...box, left: 100, top: 100 };
+  scrolled = 0;
+  const t0 = Date.now();
+  await ex.execute('browser_type', { ref: 'e2', text: 'Hi a!' }, 30000, 's');
+  const elapsed = Date.now() - t0;
+  const keys = sent.filter((c) => c.method === 'Input.dispatchKeyEvent').map((c) => c.params);
+  ok(!sent.some((c) => c.method === 'Input.insertText'), 'short text is typed, never inserted at once');
+  const typed = keys.filter((k) => k.type === 'keyDown').map((k) => k.text).join('');
+  ok(typed === 'Hi a!', `every character is its own keystroke ("${typed}")`);
+  const H = keys.find((k) => k.type === 'keyDown' && k.text === 'H');
+  ok(H && H.code === 'KeyH' && H.windowsVirtualKeyCode === 72 && H.modifiers === 8, 'a capital carries KeyH, keyCode 72 and Shift');
+  const bang = keys.find((k) => k.type === 'keyDown' && k.text === '!');
+  ok(bang && bang.code === 'Digit1' && bang.modifiers === 8, '"!" is Shift+Digit1, as on a keyboard');
+  const shiftDowns = keys.filter((k) => k.key === 'Shift' && k.type === 'rawKeyDown').length;
+  const shiftUps = keys.filter((k) => k.key === 'Shift' && k.type === 'keyUp').length;
+  ok(shiftDowns >= 2 && shiftDowns === shiftUps, `Shift is pressed and released around capitals (${shiftDowns}×)`);
+  const selectAll = keys.find((k) => k.type === 'rawKeyDown' && k.key === 'a');
+  ok(
+    selectAll && selectAll.modifiers === (IS_MAC ? 4 : 2),
+    `existing text is selected with ${IS_MAC ? '⌘A' : 'Ctrl+A'}, not from script`
+  );
+  ok(elapsed >= 5 * 45, `typing takes human time (${elapsed} ms for 5 characters)`);
+
+  sent.length = 0;
+  await ex.execute('browser_type', { ref: 'e2', text: 'x'.repeat(400) }, 4000, 's');
+  const ins = sent.filter((c) => c.method === 'Input.insertText');
+  const struck = sent.filter((c) => c.method === 'Input.dispatchKeyEvent' && c.params.type === 'keyDown').length;
+  ok(
+    struck > 0 && ins.length === 1 && struck + ins[0].params.text.length === 400,
+    `long text is typed until the budget, then the rest inserted (${struck} keys + ${ins[0]?.params.text.length})`
+  );
+
+  sent.length = 0;
+  await ex.execute('browser_press_key', { key: 'Shift+Tab' }, 5000, 's');
+  const combo = sent.filter((c) => c.method === 'Input.dispatchKeyEvent').map((c) => `${c.params.type}:${c.params.key}:${c.params.modifiers}`);
+  ok(
+    combo.join(' ') === 'rawKeyDown:Shift:8 rawKeyDown:Tab:8 keyUp:Tab:8 keyUp:Shift:0',
+    `a shortcut is modifiers down, key, modifiers up (${combo.join(' ')})`
+  );
+  sent.length = 0;
+  await ex.execute('browser_press_key', { key: 'a' }, 5000, 's');
+  const a = sent.find((c) => c.method === 'Input.dispatchKeyEvent').params;
+  ok(a.code === 'KeyA' && a.windowsVirtualKeyCode === 65, 'a bare letter is KeyA / 65, not code "a"');
+}
+
+console.log('native select:');
+{
+  const { IS_MAC } = await import('../packages/extension/src/human.js');
+  sent.length = 0;
+  sel = { index: 0, target: 3 };
+  await ex.execute('browser_select_option', { ref: 'e3', value: 'Green' }, 30000, 's');
+  const scripted = !!sel.scripted;
+  if (IS_MAC) {
+    const arrows = sent.filter((c) => c.method === 'Input.dispatchKeyEvent' && /^Arrow/.test(c.params.key)).length;
+    ok(arrows === 0, 'on a Mac, arrow keys are never pressed (they open the OS list)');
+    ok(scripted, 'and when type-ahead cannot land, the scripted path still chooses');
+  } else {
+    ok(sel.index === 3, 'arrow keys walk a closed <select> to the option');
+    ok(!scripted, 'and the scripted path is not used when the keyboard landed');
+  }
+}
+
+console.log('pacing:');
+{
+  sent.length = 0;
+  box = { ...box, left: 100, top: 100 };
+  scrolled = 0;
+  await ex.execute('browser_click', { ref: 'e1' }, 5000, 's');
+  const t0 = Date.now();
+  await ex.execute('browser_click', { ref: 'e1' }, 5000, 's');
+  ok(Date.now() - t0 >= 250, `back-to-back actions are spaced like a person's (${Date.now() - t0} ms)`);
+  const navs = [];
+  const real = chrome.debugger.sendCommand;
+  chrome.debugger.sendCommand = (t, m, p, cb) => {
+    if (m === 'Page.navigate') navs.push({ at: Date.now(), p });
+    return real(t, m, p, cb);
+  };
+  await ex.execute('browser_navigate', { url: 'https://example.com/a' }, 30000, 's');
+  await ex.execute('browser_navigate', { url: 'https://example.com/b' }, 30000, 's');
+  chrome.debugger.sendCommand = real;
+  ok(navs.length === 2 && navs[1].at - navs[0].at >= 1150, `navigations are rate-limited (${navs[1].at - navs[0].at} ms apart)`);
+  ok(navs[0].p.transitionType === 'typed', 'a navigation arrives the way a typed URL does');
+}
+
+console.log('full-page screenshot:');
+{
+  sent.length = 0;
+  doc = { y: 500, vh: 700, vw: 1000, h: 2400 };
+  ex.stitch = async (frames) => frames.map((f) => f.data).join('|');
+  const res = await ex.execute('browser_take_screenshot', { fullPage: true }, 30000, 's');
+  delete ex.stitch;
+  ok(!sent.some((c) => c.params && c.params.captureBeyondViewport), 'the viewport is never resized to the document');
+  const parts = res.content[0].data.split('|');
+  ok(parts.length >= 3 && parts[0] === 'FRAME@0', `the page is captured screen by screen from the top (${parts.join(', ')})`);
+  ok(parts[parts.length - 1] === `FRAME@${doc.h - doc.vh}`, 'down to the bottom');
+  ok(doc.y === 500, `and the page is wheeled back to where it was (y=${doc.y})`);
+}
 
 console.log('overlay (happy-dom):');
 {

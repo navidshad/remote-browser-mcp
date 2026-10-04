@@ -112,6 +112,9 @@ function startMockExtension(wsPort) {
   const executor = new Executor((attached, tabId, url, reason) =>
     send({ t: "status", attached, tabId: tabId ?? null, url: url ?? null, reason, sessions: executor.sessionsSummary() })
   );
+  // This harness TIMES page loads to prove cross-tab parallelism; the human pauses a navigation now
+  // takes (see PACE) would be measured as load time. Pacing has its own checks in stealth-test.
+  executor.pace = { ...executor.pace, actionGap: [0, 0], navGap: [0, 0], settle: [0, 0] };
   const ready = new Promise((resolve, reject) => {
     ws = new WebSocket(`ws://localhost:${wsPort}`);
     ws.on("open", () => send({ t: "hello", token: TOKEN, ext: "mock", v: 1, profile: "Mock" }));

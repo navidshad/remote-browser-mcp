@@ -18,10 +18,33 @@ import {
   FOCUS_FN,
   SELECT_ALL_FN,
   SELECT_OPTION_FN,
+  SELECT_STATE_FN,
+  FIELD_STATE_FN,
+  ALL_SELECTED_FN,
+  CARET_END_FN,
+  SCROLL_STATE_FN,
   OVERLAY_FN,
   OVERLAY_HIDE_FN,
   ALLOW_INPUT_FN,
 } from "./page-scripts.js";
+import {
+  rand,
+  sleep,
+  clamp,
+  WHEEL_TICK,
+  MAX_WHEEL_TICKS,
+  onScreen,
+  aimPoint,
+  mousePath,
+  IS_MAC,
+  MOD,
+  charKey,
+  parseCombo,
+  macCommands,
+  keyGap,
+  keyHold,
+  stitchFrames,
+} from "./human.js";
 
 const PROTOCOL = "1.3";
 /** Name of the isolated world page-scripts run in. Never visible to the page; see `isolatedContext`. */
@@ -44,103 +67,20 @@ const COLOR_CSS = {
   grey: "#6b7280",
 };
 
-const KEY_MAP = {
-  Enter: { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" },
-  Tab: { key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 },
-  Escape: { key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 },
-  Backspace: { key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 },
-  Delete: { key: "Delete", code: "Delete", windowsVirtualKeyCode: 46 },
-  ArrowDown: { key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 },
-  ArrowUp: { key: "ArrowUp", code: "ArrowUp", windowsVirtualKeyCode: 38 },
-  ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", windowsVirtualKeyCode: 37 },
-  ArrowRight: { key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39 },
-  Home: { key: "Home", code: "Home", windowsVirtualKeyCode: 36 },
-  End: { key: "End", code: "End", windowsVirtualKeyCode: 35 },
-  PageDown: { key: "PageDown", code: "PageDown", windowsVirtualKeyCode: 34 },
-  PageUp: { key: "PageUp", code: "PageUp", windowsVirtualKeyCode: 33 },
-};
-
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 
-// ── human-shaped input ─────────────────────────────────────────────────────────────────────────
-//
-// CDP input is TRUSTED (`isTrusted` is true), so a page cannot tell it from a person by the event
-// itself — only by its SHAPE. A pointer that teleports to the exact centre of every target and
-// clicks in 0 ms, and a page that jumps to each element with no wheel events, is a shape no person
-// makes, and bot-scoring scripts look for exactly that. So the pointer travels a curved, eased
-// path from where it last was, lands on a random point inside the target, and clicks with a
-// human press; scrolling is mouse-wheel ticks. The cost is a few hundred milliseconds per action.
-const rand = (a, b) => a + Math.random() * (b - a);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
-/** Roughly normal on [-1, 1] — most clicks near the middle of a target, few near its edge. */
-const bell = () => (Math.random() + Math.random() + Math.random()) / 1.5 - 1;
-const WHEEL_TICK = 100; // px per notch, Chrome's default on every desktop OS
-const MAX_WHEEL_TICKS = 40;
+// HUMAN-SHAPED INPUT lives in human.js: a page cannot tell trusted CDP input from a person by the
+// event, only by its shape, so every click, key, scroll and capture below goes through it.
 
-/** The part of an element's box inside the viewport, or null if none of it is. */
-function visiblePart(box) {
-  if (box.w == null || box.vw == null) return null;
-  const l = Math.max(box.left, 0);
-  const t = Math.max(box.top, 0);
-  const r = Math.min(box.left + box.w, box.vw);
-  const b = Math.min(box.top + box.h, box.vh);
-  return r - l >= 1 && b - t >= 1 ? { l, t, r, b } : null;
-}
-
-/** Is enough of the element on screen to click it the way a person would? Wholly visible, or —
- *  for something larger than the viewport — covering its middle. */
-function onScreen(box) {
-  if (box.w == null || box.vw == null) return true; // nothing to judge by — trust the caller
-  const v = visiblePart(box);
-  if (!v) return false;
-  const fitsY = box.top >= 0 && box.top + box.h <= box.vh;
-  const fitsX = box.left >= 0 && box.left + box.w <= box.vw;
-  const spansY = box.h > box.vh * 0.6 && v.b - v.t >= box.vh * 0.4;
-  const spansX = box.w > box.vw * 0.6 && v.r - v.l >= box.vw * 0.4;
-  return (fitsY || spansY) && (fitsX || spansX);
-}
-
-/** A random point inside the visible part of the box, biased to its middle. */
-function aimPoint(box) {
-  const v = visiblePart(box);
-  if (!v) return { x: box.x, y: box.y };
-  const cx = (v.l + v.r) / 2;
-  const cy = (v.t + v.b) / 2;
-  const hw = (v.r - v.l) / 2;
-  const hh = (v.b - v.t) / 2;
-  return {
-    x: clamp(cx + bell() * hw * 0.6, v.l + Math.min(2, hw), v.r - Math.min(2, hw)),
-    y: clamp(cy + bell() * hh * 0.6, v.t + Math.min(2, hh), v.b - Math.min(2, hh)),
-  };
-}
-
-/** Points along a cubic Bézier from `a` to `b`, bowed to one side and eased in and out. */
-function mousePath(a, b) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 3) return [b];
-  // Perpendicular unit vector, for the bow.
-  const px = -dy / dist;
-  const py = dx / dist;
-  const bow1 = rand(-0.25, 0.25) * dist;
-  const bow2 = rand(-0.25, 0.25) * dist;
-  const c1 = { x: a.x + dx * rand(0.2, 0.4) + px * bow1, y: a.y + dy * rand(0.2, 0.4) + py * bow1 };
-  const c2 = { x: a.x + dx * rand(0.6, 0.8) + px * bow2, y: a.y + dy * rand(0.6, 0.8) + py * bow2 };
-  const steps = clamp(Math.round(dist / rand(18, 30)), 6, 35);
-  const out = [];
-  for (let i = 1; i <= steps; i++) {
-    const t0 = i / steps;
-    const t = t0 < 0.5 ? 2 * t0 * t0 : 1 - Math.pow(-2 * t0 + 2, 2) / 2; // ease in-out
-    const u = 1 - t;
-    const x = u * u * u * a.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.x;
-    const y = u * u * u * a.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.y;
-    // Sub-pixel tremor everywhere but the landing point, which must be exactly where we aimed.
-    out.push(i === steps ? b : { x: x + rand(-0.6, 0.6), y: y + rand(-0.6, 0.6) });
-  }
-  return out;
-}
+/** Pacing between actions on one tab. Agents rarely act faster than a model round trip, but when
+ *  they do — a batch of steps — a person still would not. */
+export const PACE = {
+  actionGap: [250, 700], // ms between two input actions on one tab
+  navGap: [1200, 2500], // ms between two navigations of one tab
+  settle: [300, 800], // ms a person spends looking at a page that just loaded
+  typeBudgetMs: 15000, // typing time after which the rest is inserted at once (see `type`)
+  maxScreens: 10, // viewport captures in one full-page screenshot
+};
 
 /** Every command that runs against one owned tab — `execute`'s switch, named once up front so an
  *  unknown command is refused before any tab is resolved (or opened). Keep the two in step. */
@@ -238,6 +178,11 @@ export class Executor {
     this.frames = new Map();
     // chromeTabId -> {x, y} — where our pointer last was, so the next move starts from there
     this.cursors = new Map();
+    // chromeTabId -> ms timestamps of the last input action / navigation, for `PACE`
+    this.lastInput = new Map();
+    this.lastNav = new Map();
+    // Per instance so a harness that TIMES page loads can switch the human pauses off.
+    this.pace = PACE;
   }
 
   // ── session / tab bookkeeping ────────────────────────────────────────────────
@@ -436,6 +381,26 @@ export class Executor {
   forgetTab(tabId) {
     this.frames.delete(tabId);
     this.cursors.delete(tabId);
+    this.lastInput.delete(tabId);
+    this.lastNav.delete(tabId);
+  }
+
+  /** Wait until at least a random `[lo, hi]` ms have passed since `map`'s mark for this tab. */
+  async spaceOut(map, tabId, [lo, hi]) {
+    const last = map.get(tabId);
+    if (last == null) return;
+    const wait = last + rand(lo, hi) - Date.now();
+    if (wait > 0) await sleep(wait);
+  }
+
+  /** Run one input action no sooner than a person would have after the previous one. */
+  async paced(tabId, fn) {
+    await this.spaceOut(this.lastInput, tabId, this.pace.actionGap);
+    try {
+      return await fn();
+    } finally {
+      this.lastInput.set(tabId, Date.now());
+    }
   }
 
   /**
@@ -604,17 +569,25 @@ export class Executor {
         case "browser_snapshot":
           return this.snapshot(chromeTabId, { find: a.find, ref: a.ref });
         case "browser_click":
-          return this.withInputAllowed(chromeTabId, () => this.click(chromeTabId, a.ref, a.element));
+          return this.withInputAllowed(chromeTabId, () =>
+            this.paced(chromeTabId, () => this.click(chromeTabId, a.ref, a.element))
+          );
         case "browser_type":
           return this.withInputAllowed(chromeTabId, () =>
-            this.type(chromeTabId, a.ref, a.text, a.submit, a.slowly, a.append)
+            this.paced(chromeTabId, () =>
+              this.type(chromeTabId, a.ref, a.text, a.submit, a.slowly, a.append, deadlineMs)
+            )
           );
         case "browser_select_option":
-          return this.withInputAllowed(chromeTabId, () => this.selectOption(chromeTabId, a.ref, a.value));
+          return this.withInputAllowed(chromeTabId, () =>
+            this.paced(chromeTabId, () => this.selectOption(chromeTabId, a.ref, a.value))
+          );
         case "browser_press_key":
-          return this.withInputAllowed(chromeTabId, () => this.pressKey(chromeTabId, a.key));
+          return this.withInputAllowed(chromeTabId, () =>
+            this.paced(chromeTabId, () => this.pressKey(chromeTabId, a.key))
+          );
         case "browser_take_screenshot":
-          return this.screenshot(chromeTabId, a.fullPage);
+          return this.screenshot(chromeTabId, a.fullPage, a.ref);
         case "browser_wait_for":
           return this.waitFor(chromeTabId, a, deadlineMs);
         default:
@@ -646,8 +619,13 @@ export class Executor {
         );
       }
     }
-    await this.sendCdp(tabId, "Page.navigate", { url });
+    // No faster than a person moves from page to page, and the way a person arrives at a URL they
+    // were given: typed into the address bar, which also means no referrer, exactly as before.
+    await this.spaceOut(this.lastNav, tabId, this.pace.navGap);
+    this.lastNav.set(tabId, Date.now());
+    await this.sendCdp(tabId, "Page.navigate", { url, transitionType: "typed" });
     await this.waitForLoad(tabId, Math.min(deadlineMs || 30000, 30000));
+    await sleep(rand(...this.pace.settle));
     // The navigation wiped the page (and the overlay with it) — re-show it so
     // the ring stays visible on the freshly loaded document.
     this.showAction(tabId, session, `navigate → ${url}`);
@@ -774,10 +752,24 @@ export class Executor {
     return text(`Clicked ${element || ref}`);
   }
 
-  async type(tabId, ref, value, submit, slowly, append) {
+  /**
+   * TYPING IS KEYSTROKES. It used to be one `Input.insertText` — the whole string appearing at once
+   * with no key ever pressed, which a page sees as text with no `keydown` before it. Now:
+   *
+   *   1. the field is focused by CLICKING it (script `focus()` only if something covers it);
+   *   2. existing text is selected with ⌘A / Ctrl+A, then typed over — as a person replaces it;
+   *   3. each character is a real key — `key`, `code`, `keyCode`, Shift held for capitals — with
+   *      a human hold and a human, irregular gap.
+   *
+   * A BUDGET bounds it. A person types a sentence in seconds and a page in minutes, and a command
+   * has a deadline; past `this.pace.typeBudgetMs` (or 40% of the deadline) the remainder is inserted at
+   * once, which is what a paste looks like. `slowly` lifts the budget to most of the deadline, for
+   * a field that must see every key. Newlines and tabs are always inserted, never pressed: Enter
+   * submits a form and Tab leaves the field, neither of which typing text should do.
+   */
+  async type(tabId, ref, value, submit, slowly, append, deadlineMs) {
     if (!ref) throw new ToolError("bad_args", "ref is required");
-    // A person focuses a field by CLICKING it, so do that; `el.focus()` from script is the fallback
-    // for a field something else covers, or one with no box to click.
+    const str = String(value ?? "");
     const box = await this.locate(tabId, ref);
     let focused = false;
     if (box.w > 0 && box.h > 0) {
@@ -790,27 +782,184 @@ export class Executor {
         throw new ToolError("ref_expired", `ref ${ref} not found — re-run browser_snapshot and use a fresh ref`);
       }
     }
-    if (!append) {
-      const sel = await this.evalFn(tabId, SELECT_ALL_FN, ref);
-      // Fast path: Input.insertText below replaces the current selection in one call.
-      // Slow path types per-char, so clear the selection first with a single Delete.
-      if (slowly && sel && !sel.empty) await this.dispatchKey(tabId, "Delete");
-    }
-    if (slowly) {
-      for (const ch of String(value)) {
-        await this.sendCdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", text: ch });
-        await this.sendCdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", text: ch });
-      }
+    if (append) {
+      await this.evalFn(tabId, CARET_END_FN, ref).catch(() => {});
     } else {
-      await this.sendCdp(tabId, "Input.insertText", { text: String(value) });
+      const st = await this.evalFn(tabId, FIELD_STATE_FN, ref).catch(() => null);
+      if (!st || !st.empty) {
+        await sleep(rand(80, 200));
+        await this.pressCombo(tabId, "Mod+a");
+        const all = await this.evalFn(tabId, ALL_SELECTED_FN, ref).catch(() => false);
+        if (!all) await this.evalFn(tabId, SELECT_ALL_FN, ref);
+        // Typing replaces a selection; with nothing to type, the selection still has to go.
+        if (!str) await this.pressCombo(tabId, "Backspace");
+      }
     }
-    if (submit) await this.dispatchKey(tabId, "Enter");
+    const deadline = deadlineMs || 30000;
+    const budget = slowly ? deadline * 0.8 : Math.min(this.pace.typeBudgetMs, deadline * 0.4);
+    await this.typeText(tabId, str, budget);
+    if (submit) {
+      await sleep(rand(150, 400));
+      await this.pressCombo(tabId, "Enter");
+    }
     return text(`Typed into ${ref}${submit ? " and submitted" : ""}`);
   }
 
+  /** Keystroke by keystroke until `budgetMs` is spent, then the rest at once. */
+  async typeText(tabId, str, budgetMs) {
+    const chars = [...str];
+    const start = Date.now();
+    let shift = false;
+    let i = 0;
+    const shiftKey = (type) =>
+      this.sendCdp(tabId, "Input.dispatchKeyEvent", {
+        type,
+        key: "Shift",
+        code: "ShiftLeft",
+        windowsVirtualKeyCode: 16,
+        nativeVirtualKeyCode: 16,
+        location: 1,
+        modifiers: type === "keyUp" ? 0 : MOD.Shift,
+      });
+    for (; i < chars.length; i++) {
+      if (Date.now() - start > budgetMs) break;
+      const ch = chars[i];
+      const def = ch === "\n" || ch === "\r" || ch === "\t" ? null : charKey(ch);
+      if (def && def.shift !== shift) {
+        await shiftKey(def.shift ? "rawKeyDown" : "keyUp");
+        shift = def.shift;
+        await sleep(rand(30, 80));
+      }
+      if (def) {
+        await this.keyStroke(tabId, def, shift ? MOD.Shift : 0);
+      } else {
+        if (shift) {
+          await shiftKey("keyUp");
+          shift = false;
+        }
+        await this.sendCdp(tabId, "Input.insertText", { text: ch });
+      }
+      if (i < chars.length - 1) await sleep(keyGap(ch));
+    }
+    if (shift) await shiftKey("keyUp");
+    if (i < chars.length) await this.sendCdp(tabId, "Input.insertText", { text: chars.slice(i).join("") });
+  }
+
+  /** One key: down, a human hold, up. Text only when no command modifier is held — Ctrl+A selects,
+   *  it does not type an "a". */
+  async keyStroke(tabId, def, modifiers, commands) {
+    const base = {
+      key: def.key,
+      code: def.code,
+      windowsVirtualKeyCode: def.vk,
+      nativeVirtualKeyCode: def.vk,
+      modifiers,
+    };
+    if (def.location) base.location = def.location;
+    const typing = def.text && !(modifiers & (MOD.Control | MOD.Meta | MOD.Alt));
+    const down = { type: typing ? "keyDown" : "rawKeyDown", ...base };
+    if (typing) {
+      down.text = def.text;
+      down.unmodifiedText = def.text;
+    }
+    if (commands) down.commands = commands;
+    await this.sendCdp(tabId, "Input.dispatchKeyEvent", down);
+    await sleep(keyHold());
+    await this.sendCdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  }
+
+  /** "Enter", "Shift+Tab", "Control+a", "Mod+a" (⌘ on a Mac, Ctrl elsewhere): modifiers go down
+   *  in order, the key is struck, and they come up in reverse — as fingers do. */
+  async pressCombo(tabId, combo) {
+    const parsed = parseCombo(combo);
+    if (!parsed) throw new ToolError("bad_args", `unknown key "${combo}"`);
+    let mods = 0;
+    for (const m of parsed.mods) {
+      const def = parseCombo(m).key;
+      mods |= MOD[m];
+      await this.sendCdp(tabId, "Input.dispatchKeyEvent", {
+        type: "rawKeyDown",
+        key: def.key,
+        code: def.code,
+        windowsVirtualKeyCode: def.vk,
+        nativeVirtualKeyCode: def.vk,
+        location: 1,
+        modifiers: mods,
+      });
+      await sleep(rand(30, 90));
+    }
+    await this.keyStroke(tabId, parsed.key, mods, macCommands(parsed.mods, parsed.key));
+    for (const m of [...parsed.mods].reverse()) {
+      const def = parseCombo(m).key;
+      mods &= ~MOD[m];
+      await sleep(rand(20, 60));
+      await this.sendCdp(tabId, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: def.key,
+        code: def.code,
+        windowsVirtualKeyCode: def.vk,
+        nativeVirtualKeyCode: def.vk,
+        location: 1,
+        modifiers: mods,
+      });
+    }
+  }
+
+  /**
+   * CHOSEN WITH THE KEYBOARD FIRST. Setting the property from script fires `input`/`change` events
+   * whose `isTrusted` is false — a page can tell. A focused, CLOSED <select> answers typed letters
+   * (type-ahead: the whole label, fast, which also crosses spaces) and, off a Mac, arrow keys, and
+   * the browser fires trusted events for both. Neither opens the OS-drawn list CDP cannot reach
+   * (arrow keys DO open it on a Mac, so there they are never pressed).
+   *
+   * Every step is CHECKED, never assumed — the failure SELECT_OPTION_FN's note warns about is a
+   * keyboard imitation that reports success with the wrong value chosen. If the keyboard cannot
+   * land on the option, the scripted path below is the fallback, exactly as before.
+   */
   async selectOption(tabId, ref, value) {
     if (!ref) throw new ToolError("bad_args", "ref is required");
+    const m = await this.evalFn(tabId, SELECT_OPTION_FN, { ref, value, matchOnly: true });
+    this.selectErrors(ref, value, m);
+    if (m.current === m.index) return text(`Selected "${m.label}" in ${ref}`);
+    if (await this.selectByKeyboard(tabId, ref, m)) return text(`Selected "${m.label}" in ${ref}`);
     const r = await this.evalFn(tabId, SELECT_OPTION_FN, { ref, value });
+    this.selectErrors(ref, value, r);
+    return text(`Selected "${r.label}" in ${ref}`);
+  }
+
+  async selectByKeyboard(tabId, ref, m) {
+    const focused = await this.evalFn(tabId, FOCUS_FN, ref).catch(() => null);
+    if (!focused || !focused.found) return false;
+    const state = async () => {
+      const s = await this.evalFn(tabId, SELECT_STATE_FN, ref).catch(() => null);
+      return s && s.found ? s.index : null;
+    };
+    await sleep(rand(120, 300));
+    // Type-ahead: the label's printable prefix, inside the browser's one-second window.
+    const prefix = [...String(m.label || "")].slice(0, 24);
+    if (prefix.length && charKey(prefix[0]) && prefix[0] !== " ") {
+      for (const ch of prefix) {
+        const def = charKey(ch);
+        if (!def) break;
+        await this.keyStroke(tabId, def, def.shift ? MOD.Shift : 0);
+        await sleep(rand(40, 110));
+      }
+    }
+    let at = await state();
+    if (at === m.index) return true;
+    if (IS_MAC || at == null) return false;
+    for (let step = 0; step < 60 && at !== m.index; step++) {
+      await this.pressCombo(tabId, at < m.index ? "ArrowDown" : "ArrowUp");
+      await sleep(rand(40, 110));
+      const next = await state();
+      if (next === at || next == null) return false; // no progress — a disabled run or a page that ate the key
+      at = next;
+    }
+    return at === m.index;
+  }
+
+  /** Turn SELECT_OPTION_FN's verdict into the sentence an agent reads. */
+  selectErrors(ref, value, r) {
     if (!r || !r.found) {
       throw new ToolError("ref_expired", `ref ${ref} not found — re-run browser_snapshot and use a fresh ref`);
     }
@@ -843,24 +992,98 @@ export class Executor {
       }
       throw new ToolError("no_such_option", `No option matching "${value}".${list}`);
     }
-    return text(`Selected "${r.label}" in ${ref}`);
   }
 
   async pressKey(tabId, key) {
     if (!key) throw new ToolError("bad_args", "key is required");
-    await this.dispatchKey(tabId, key);
+    await this.pressCombo(tabId, key);
     return text(`Pressed ${key}`);
   }
 
-  async dispatchKey(tabId, key) {
-    const def = KEY_MAP[key] || { key, code: key, text: key.length === 1 ? key : undefined };
-    await this.sendCdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", ...def });
-    await this.sendCdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...def });
+  /** Scroll the document by about `dy` CSS px in wheel notches, then wait for it to come to rest.
+   *  Returns the new scroll position. */
+  async wheelBy(tabId, dy, vw, vh) {
+    const at = this.cursors.get(tabId) || { x: vw * rand(0.35, 0.65), y: vh * rand(0.35, 0.65) };
+    this.cursors.set(tabId, at);
+    // Whole notches, then the remainder as one smaller delta — a trackpad's last nudge — so a
+    // return to a saved position lands on it rather than within a notch of it.
+    const steps = new Array(Math.floor(Math.abs(dy) / WHEEL_TICK)).fill(WHEEL_TICK);
+    const rest = Math.abs(dy) - steps.length * WHEEL_TICK;
+    if (rest >= 2 || !steps.length) steps.push(Math.max(rest, 1));
+    for (const step of steps) {
+      await this.sendCdp(tabId, "Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x: at.x,
+        y: at.y,
+        deltaX: 0,
+        deltaY: Math.sign(dy) * step,
+      });
+      await sleep(rand(12, 35));
+    }
+    // Chrome animates wheel scrolling; capture only once it has stopped.
+    let prev = null;
+    for (let i = 0; i < 25; i++) {
+      await sleep(60);
+      const s = await this.evalFn(tabId, SCROLL_STATE_FN).catch(() => null);
+      if (!s) return null;
+      if (prev != null && Math.abs(s.y - prev) < 0.5) return s.y;
+      prev = s.y;
+    }
+    return prev;
   }
 
-  async screenshot(tabId, fullPage) {
-    const params = { format: "png", captureBeyondViewport: !!fullPage };
-    const res = await this.sendCdp(tabId, "Page.captureScreenshot", params);
+  /**
+   * A FULL PAGE IS SCROLLED THROUGH, not resized. `captureBeyondViewport` grows the viewport to
+   * the document's height for the capture — the page gets a `resize`, `innerHeight` jumps, media
+   * queries and lazy-loaders fire — a thing no person's window does. Instead: wheel to the top,
+   * capture a screen, wheel down, capture, …, stitch, and wheel back to where the page was.
+   * Falls back to the old capture only when the wheel cannot move the document at all.
+   */
+  async screenshot(tabId, fullPage, ref) {
+    if (ref) {
+      const box = await this.locate(tabId, ref);
+      const x = Math.max(box.left ?? 0, 0);
+      const y = Math.max(box.top ?? 0, 0);
+      const w = Math.max(1, Math.min((box.left ?? 0) + (box.w ?? 1), box.vw ?? x + 1) - x);
+      const h = Math.max(1, Math.min((box.top ?? 0) + (box.h ?? 1), box.vh ?? y + 1) - y);
+      return this.capture(tabId, { clip: { x, y, width: w, height: h, scale: 1 } });
+    }
+    if (!fullPage) return this.capture(tabId, {});
+    const m = await this.evalFn(tabId, SCROLL_STATE_FN).catch(() => null);
+    if (!m || !m.vh || m.h <= m.vh + 1) return this.capture(tabId, {});
+    const startY = m.y;
+    let y = startY > 0 ? await this.wheelBy(tabId, -startY, m.vw, m.vh) : 0;
+    if (y == null || y > 1) return this.capture(tabId, { captureBeyondViewport: true });
+    const frames = [];
+    for (;;) {
+      const shot = await this.sendCdp(tabId, "Page.captureScreenshot", { format: "png" });
+      if (!shot || !shot.data) throw new ToolError("screenshot_failed", "no image data returned");
+      frames.push({ data: shot.data, y });
+      if (y + m.vh >= m.h - 1 || frames.length >= this.pace.maxScreens) break;
+      const next = await this.wheelBy(tabId, m.vh * rand(0.85, 0.95), m.vw, m.vh);
+      if (next == null || next <= y + 0.5) break; // the bottom, or a page that would not scroll
+      y = next;
+      await sleep(rand(80, 220));
+    }
+    const back = await this.evalFn(tabId, SCROLL_STATE_FN).catch(() => null);
+    if (back && Math.abs(back.y - startY) > 1) await this.wheelBy(tabId, startY - back.y, m.vw, m.vh);
+    if (frames.length === 1 && m.h > m.vh + 1) {
+      // The wheel reached nothing — an inner scroller under the pointer. One frame of a long page
+      // would be a quiet lie about what "full page" returned.
+      return this.capture(tabId, { captureBeyondViewport: true });
+    }
+    const data = frames.length === 1 ? frames[0].data : await this.stitch(frames, m.vh);
+    if (data) return { content: [{ type: "image", data, mimeType: "image/png" }] };
+    return { content: frames.map((f) => ({ type: "image", data: f.data, mimeType: "image/png" })) };
+  }
+
+  /** Overridable for tests; null when there is no canvas (Node), and the frames go back as-is. */
+  stitch(frames, vh) {
+    return stitchFrames(frames, vh);
+  }
+
+  async capture(tabId, extra) {
+    const res = await this.sendCdp(tabId, "Page.captureScreenshot", { format: "png", ...extra });
     if (!res || !res.data) throw new ToolError("screenshot_failed", "no image data returned");
     return { content: [{ type: "image", data: res.data, mimeType: "image/png" }] };
   }
@@ -921,7 +1144,11 @@ export class Executor {
     const handle = this.registerTab(session, created.id, url || "about:blank");
     await this.ensureGrouped(session, created.id);
     await this.withTabLock(created.id, () => this.ensureAttached(created.id));
-    if (url) await this.waitForLoad(created.id, Math.min(deadlineMs || 30000, 30000), true);
+    if (url) {
+      this.lastNav.set(created.id, Date.now());
+      await this.waitForLoad(created.id, Math.min(deadlineMs || 30000, 30000), true);
+      await sleep(rand(...this.pace.settle));
+    }
     this.showAction(created.id, session, `opened ${handle}${url ? ` → ${url}` : ""}`);
     const info = await chrome.tabs.get(created.id).catch(() => null);
     if (info) session.tabs.get(handle).url = info.url;
