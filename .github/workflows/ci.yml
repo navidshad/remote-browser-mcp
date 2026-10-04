@@ -62,6 +62,7 @@ jobs:
         run: |
           npm run test:snapshot
           npm run test:select
+          npm run test:stealth
           npm run test:registry
           npm run test:guard
           npm run test:popup

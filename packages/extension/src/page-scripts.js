@@ -3,6 +3,13 @@
 // resolve [ref=eNN] ids back to live elements. Refs live on window.__rbm and are
 // regenerated every snapshot (per-snapshot epoch) — the same contract Playwright
 // uses: re-snapshot after navigation/DOM changes.
+//
+// THEY RUN IN AN ISOLATED WORLD, not the page's own (see `Executor.isolatedContext`). The DOM is
+// shared; the JavaScript globals are not. So `window.__rbm` and every other `__rbm*` name below
+// lives on a `window` the page's scripts cannot see — they used to sit on the page's own `window`,
+// where any script could read them and conclude an automation tool was driving the tab. Nothing
+// here may rely on a property the PAGE's scripts put on an element (an expando such as React's
+// `_valueTracker`): from this world those are simply absent.
 
 /** Returns a YAML-ish accessibility tree string; stamps window.__rbm.elements. */
 export const SNAPSHOT_FN = function (narrow) {
@@ -259,6 +266,35 @@ export const RESOLVE_BOX_FN = function (ref) {
   };
 };
 
+/** Measure a ref WITHOUT scrolling, plus the viewport — the executor scrolls with the mouse wheel
+ *  itself, as a person would, and only falls back to `RESOLVE_BOX_FN`'s `scrollIntoView` when the
+ *  wheel cannot reach the element (a nested scroller the cursor is not over). */
+export const BOX_FN = function (ref) {
+  const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
+  if (!el || !el.isConnected) return { found: false };
+  const r = el.getBoundingClientRect();
+  return {
+    found: true,
+    x: r.left + r.width / 2,
+    y: r.top + r.height / 2,
+    left: r.left,
+    top: r.top,
+    w: r.width,
+    h: r.height,
+    vw: window.innerWidth,
+    vh: window.innerHeight,
+    tag: el.tagName.toLowerCase(),
+  };
+};
+
+/** Did the last (trusted) click actually put focus in this ref? If something covered it, the
+ *  executor falls back to `FOCUS_FN`. */
+export const IS_FOCUSED_FN = function (ref) {
+  const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
+  const a = document.activeElement;
+  return !!(el && a && (el === a || el.contains(a)));
+};
+
 /** Focus a ref's element (for typing). */
 export const FOCUS_FN = function (ref) {
   const el = window.__rbm && window.__rbm.elements && window.__rbm.elements[ref];
@@ -271,10 +307,17 @@ export const FOCUS_FN = function (ref) {
 };
 
 /** Show/refresh the agent-activity overlay: a colored ring around the viewport
- *  plus a bottom-center badge with the current action, so a human watching the
+ *  plus a top-center badge with the current action, so a human watching the
  *  window can see what the agent is doing and where. aria-hidden keeps it out of
  *  snapshots; pointer-events:none keeps it out of the way. Auto-fades after a few
  *  seconds of no agent activity (which also clears stale overlays after detach).
+ *
+ *  AS LITTLE OF IT AS POSSIBLE IS THE PAGE'S TO SEE. It used to be a `<div id="__rbm-overlay">`
+ *  that stayed in the document for good once an agent had acted — one `getElementById` and a page
+ *  knew. Now the host is an anonymous `<div>` whose ring and badge sit in a CLOSED shadow root
+ *  (the page cannot read the badge's words), its handle lives on the isolated world's `window`,
+ *  and it is REMOVED from the document once it has faded rather than hidden in place. What is left
+ *  is a styled element present only while the agent is acting.
  *
  *  With arg.block, human input (mouse/keyboard/scroll) is suppressed WHILE the
  *  overlay is visible — capture-phase listeners swallow events unless the
@@ -282,44 +325,38 @@ export const FOCUS_FN = function (ref) {
  *  Blocking is tied to overlay visibility, so it always self-releases when the
  *  agent goes idle or detaches (a stale overlay can never lock the page). */
 export const OVERLAY_FN = function (arg) {
-  const ID = "__rbm-overlay";
   const color = (arg && arg.color) || "#2563eb";
   const W = window;
-  let host = document.getElementById(ID);
-  if (!host) {
-    host = document.createElement("div");
-    host.id = ID;
+  let o = W.__rbmOverlay;
+  if (!o) {
+    const host = document.createElement("div");
     host.setAttribute("aria-hidden", "true");
     host.style.cssText =
-      "position:fixed;inset:0;z-index:2147483647;pointer-events:none;opacity:0;transition:opacity .25s ease;";
+      "all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none;opacity:0;transition:opacity .25s ease;";
+    const root = host.attachShadow({ mode: "closed" });
     const ring = document.createElement("div");
-    ring.id = ID + "-ring";
     ring.style.cssText = "position:absolute;inset:0;";
     const badge = document.createElement("div");
-    badge.id = ID + "-badge";
     badge.style.cssText =
       "position:absolute;top:10px;left:50%;transform:translateX(-50%);max-width:70vw;" +
       "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" +
       "font:600 12px/1.6 -apple-system,system-ui,sans-serif;color:#fff;" +
       "padding:3px 14px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.25);";
-    host.appendChild(ring);
-    host.appendChild(badge);
-    (document.documentElement || document.body).appendChild(host);
+    root.appendChild(ring);
+    root.appendChild(badge);
+    o = W.__rbmOverlay = { host: host, ring: ring, badge: badge };
   }
-  const ring = document.getElementById(ID + "-ring");
-  const badge = document.getElementById(ID + "-badge");
-  if (ring) ring.style.boxShadow = "inset 0 0 0 3px " + color + ", inset 0 0 28px " + color + "55";
-  if (badge) {
-    badge.style.background = color;
-    badge.textContent = (arg && arg.block ? "🔒 " : "⚡ ") + ((arg && arg.text) || "agent active");
-  }
+  const host = o.host;
+  o.ring.style.boxShadow = "inset 0 0 0 3px " + color + ", inset 0 0 28px " + color + "55";
+  o.badge.style.background = color;
+  o.badge.textContent = (arg && arg.block ? "🔒 " : "⚡ ") + ((arg && arg.text) || "agent active");
   W.__rbmBlockEnabled = !!(arg && arg.block);
   if (W.__rbmBlockEnabled && !W.__rbmBlockInstalled) {
     W.__rbmBlockInstalled = true;
     const swallow = function (e) {
-      const h = document.getElementById(ID);
+      const h = W.__rbmOverlay && W.__rbmOverlay.host;
       const blocking =
-        W.__rbmBlockEnabled && !W.__rbmAllowInput && h && h.style.display !== "none" && h.style.opacity === "1";
+        W.__rbmBlockEnabled && !W.__rbmAllowInput && h && h.isConnected && h.style.opacity === "1";
       if (blocking) {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -331,11 +368,14 @@ export const OVERLAY_FN = function (arg) {
     ];
     for (const ev of EVENTS) window.addEventListener(ev, swallow, { capture: true, passive: false });
   }
-  host.style.display = "";
+  if (!host.isConnected) (document.documentElement || document.body).appendChild(host);
   host.style.opacity = "1";
   clearTimeout(W.__rbmOverlayTimer);
   W.__rbmOverlayTimer = setTimeout(function () {
     host.style.opacity = "0"; // fading also releases the input block
+    W.__rbmOverlayTimer = setTimeout(function () {
+      host.remove(); // gone, not hidden — see above
+    }, 400);
   }, 4000);
   return true;
 };
@@ -347,13 +387,13 @@ export const ALLOW_INPUT_FN = function (allow) {
   return true;
 };
 
-/** Hide the activity overlay immediately (no fade) — used before screenshots so
+/** Remove the activity overlay immediately (no fade) — used before screenshots so
  *  the agent's captures show the page, not our ring/badge. */
 export const OVERLAY_HIDE_FN = function () {
-  const host = document.getElementById("__rbm-overlay");
-  if (host) {
-    host.style.display = "none";
-    host.style.opacity = "0";
+  const o = window.__rbmOverlay;
+  if (o) {
+    o.host.style.opacity = "0";
+    o.host.remove();
   }
   clearTimeout(window.__rbmOverlayTimer);
   return true;
@@ -411,6 +451,12 @@ export const SELECT_OPTION_FN = function (arg) {
   // without clearing the tracker the option moves on screen and the application never hears about
   // it — the single most confusing way this can half-work. Setting through the prototype's own
   // setter (rather than `el.value =`) is what keeps that tracker in the loop at all.
+  //
+  // In the isolated world this runs in, the tracker (a property the PAGE's React put on the
+  // element) is not visible, and that is fine: the page-world `value` accessor React installs is
+  // not in this world either, so the setter below changes the value WITHOUT updating React's
+  // cache — the cache keeps the old value, and the change event is seen as a change. The tracker
+  // line stays for a caller that evaluates in the page's own world.
   if (el._valueTracker && typeof el._valueTracker.setValue === "function") el._valueTracker.setValue("");
   const desc = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value");
   if (desc && desc.set) desc.set.call(el, hit.value);

@@ -13,6 +13,8 @@
 import {
   SNAPSHOT_FN,
   RESOLVE_BOX_FN,
+  BOX_FN,
+  IS_FOCUSED_FN,
   FOCUS_FN,
   SELECT_ALL_FN,
   SELECT_OPTION_FN,
@@ -22,6 +24,8 @@ import {
 } from "./page-scripts.js";
 
 const PROTOCOL = "1.3";
+/** Name of the isolated world page-scripts run in. Never visible to the page; see `isolatedContext`. */
+const WORLD_NAME = "rbm";
 const DEFAULT_SESSION = "default";
 
 // Per-session identity color, used for BOTH the Chrome tab group and the
@@ -57,6 +61,86 @@ const KEY_MAP = {
 };
 
 const text = (t) => ({ content: [{ type: "text", text: t }] });
+
+// ── human-shaped input ─────────────────────────────────────────────────────────────────────────
+//
+// CDP input is TRUSTED (`isTrusted` is true), so a page cannot tell it from a person by the event
+// itself — only by its SHAPE. A pointer that teleports to the exact centre of every target and
+// clicks in 0 ms, and a page that jumps to each element with no wheel events, is a shape no person
+// makes, and bot-scoring scripts look for exactly that. So the pointer travels a curved, eased
+// path from where it last was, lands on a random point inside the target, and clicks with a
+// human press; scrolling is mouse-wheel ticks. The cost is a few hundred milliseconds per action.
+const rand = (a, b) => a + Math.random() * (b - a);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+/** Roughly normal on [-1, 1] — most clicks near the middle of a target, few near its edge. */
+const bell = () => (Math.random() + Math.random() + Math.random()) / 1.5 - 1;
+const WHEEL_TICK = 100; // px per notch, Chrome's default on every desktop OS
+const MAX_WHEEL_TICKS = 40;
+
+/** The part of an element's box inside the viewport, or null if none of it is. */
+function visiblePart(box) {
+  if (box.w == null || box.vw == null) return null;
+  const l = Math.max(box.left, 0);
+  const t = Math.max(box.top, 0);
+  const r = Math.min(box.left + box.w, box.vw);
+  const b = Math.min(box.top + box.h, box.vh);
+  return r - l >= 1 && b - t >= 1 ? { l, t, r, b } : null;
+}
+
+/** Is enough of the element on screen to click it the way a person would? Wholly visible, or —
+ *  for something larger than the viewport — covering its middle. */
+function onScreen(box) {
+  if (box.w == null || box.vw == null) return true; // nothing to judge by — trust the caller
+  const v = visiblePart(box);
+  if (!v) return false;
+  const fitsY = box.top >= 0 && box.top + box.h <= box.vh;
+  const fitsX = box.left >= 0 && box.left + box.w <= box.vw;
+  const spansY = box.h > box.vh * 0.6 && v.b - v.t >= box.vh * 0.4;
+  const spansX = box.w > box.vw * 0.6 && v.r - v.l >= box.vw * 0.4;
+  return (fitsY || spansY) && (fitsX || spansX);
+}
+
+/** A random point inside the visible part of the box, biased to its middle. */
+function aimPoint(box) {
+  const v = visiblePart(box);
+  if (!v) return { x: box.x, y: box.y };
+  const cx = (v.l + v.r) / 2;
+  const cy = (v.t + v.b) / 2;
+  const hw = (v.r - v.l) / 2;
+  const hh = (v.b - v.t) / 2;
+  return {
+    x: clamp(cx + bell() * hw * 0.6, v.l + Math.min(2, hw), v.r - Math.min(2, hw)),
+    y: clamp(cy + bell() * hh * 0.6, v.t + Math.min(2, hh), v.b - Math.min(2, hh)),
+  };
+}
+
+/** Points along a cubic Bézier from `a` to `b`, bowed to one side and eased in and out. */
+function mousePath(a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 3) return [b];
+  // Perpendicular unit vector, for the bow.
+  const px = -dy / dist;
+  const py = dx / dist;
+  const bow1 = rand(-0.25, 0.25) * dist;
+  const bow2 = rand(-0.25, 0.25) * dist;
+  const c1 = { x: a.x + dx * rand(0.2, 0.4) + px * bow1, y: a.y + dy * rand(0.2, 0.4) + py * bow1 };
+  const c2 = { x: a.x + dx * rand(0.6, 0.8) + px * bow2, y: a.y + dy * rand(0.6, 0.8) + py * bow2 };
+  const steps = clamp(Math.round(dist / rand(18, 30)), 6, 35);
+  const out = [];
+  for (let i = 1; i <= steps; i++) {
+    const t0 = i / steps;
+    const t = t0 < 0.5 ? 2 * t0 * t0 : 1 - Math.pow(-2 * t0 + 2, 2) / 2; // ease in-out
+    const u = 1 - t;
+    const x = u * u * u * a.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.x;
+    const y = u * u * u * a.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.y;
+    // Sub-pixel tremor everywhere but the landing point, which must be exactly where we aimed.
+    out.push(i === steps ? b : { x: x + rand(-0.6, 0.6), y: y + rand(-0.6, 0.6) });
+  }
+  return out;
+}
 
 /** Every command that runs against one owned tab — `execute`'s switch, named once up front so an
  *  unknown command is refused before any tab is resolved (or opened). Keep the two in step. */
@@ -150,6 +234,10 @@ export class Executor {
     this.tabIndex = new Map();
     // chromeTabId -> Promise — per-tab serialization of CDP command chains
     this.tabLocks = new Map();
+    // chromeTabId -> main frame id, for `Page.createIsolatedWorld` (null: none reported)
+    this.frames = new Map();
+    // chromeTabId -> {x, y} — where our pointer last was, so the next move starts from there
+    this.cursors = new Map();
   }
 
   // ── session / tab bookkeeping ────────────────────────────────────────────────
@@ -317,6 +405,7 @@ export class Executor {
     if (!idx) return;
     const rec = this.sessions.get(idx.sessionId)?.tabs.get(idx.handle);
     if (rec) rec.attached = false;
+    this.forgetTab(source.tabId);
     // Don't auto-reattach: if the user hit the infobar "Cancel" the next command
     // reattaches and re-shows the bar. Report aggregate attach state.
     this.pushStatus(this.anyAttached(), source.tabId, null, reason);
@@ -328,6 +417,7 @@ export class Executor {
     const session = this.sessions.get(idx.sessionId);
     if (session) this.unregisterTab(session, idx.handle);
     this.tabLocks.delete(tabId);
+    this.forgetTab(tabId);
     this.pushStatus(this.anyAttached(), null, null, "tab_closed");
   }
 
@@ -342,14 +432,58 @@ export class Executor {
     });
   }
 
-  /** Evaluate a function (from page-scripts) in the page, returning its value. */
+  /** Drop what we cached about a tab's frame and pointer (detach, close). */
+  forgetTab(tabId) {
+    this.frames.delete(tabId);
+    this.cursors.delete(tabId);
+  }
+
+  /**
+   * The execution context of OUR isolated world in the tab's current document.
+   *
+   * WHY NOT THE PAGE'S OWN WORLD. `Runtime.evaluate` with no `contextId` runs in the page's main
+   * world, so everything page-scripts left behind — `window.__rbm` and friends — was a global the
+   * page's own scripts could read, and "is `__rbm` defined?" was a complete automation detector.
+   * An isolated world shares the DOM and nothing else: same elements, a separate `window`.
+   *
+   * ASKED FOR EVERY EVALUATION, deliberately, rather than cached. A context id dies with its
+   * document, and without `Runtime.enable` (which we no longer send — see `ensureAttached`) nothing
+   * tells us it died; worse, after a cross-process navigation a stale number can name a context in
+   * the NEW renderer, possibly the page's main world. Chrome keeps one isolated world per frame per
+   * name, so this call is idempotent within a document and always returns the live one.
+   *
+   * Null only when the target reports no frame (the test harnesses' mock chrome); a real Chrome
+   * that cannot create the world rejects, and the evaluation fails rather than falling back to the
+   * page's world.
+   */
+  async isolatedContext(tabId) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let frameId = this.frames.get(tabId);
+      if (frameId === undefined) {
+        const tree = await this.sendCdp(tabId, "Page.getFrameTree", {});
+        frameId = (tree && tree.frameTree && tree.frameTree.frame && tree.frameTree.frame.id) || null;
+        this.frames.set(tabId, frameId);
+      }
+      if (frameId == null) return null;
+      try {
+        const res = await this.sendCdp(tabId, "Page.createIsolatedWorld", { frameId, worldName: WORLD_NAME });
+        return res && res.executionContextId != null ? res.executionContextId : null;
+      } catch (e) {
+        // The main frame was replaced under us — look it up again, once.
+        this.frames.delete(tabId);
+        if (attempt === 1) throw e;
+      }
+    }
+    return null;
+  }
+
+  /** Evaluate a function (from page-scripts) in our isolated world, returning its value. */
   async evalFn(tabId, fn, arg) {
     const expr = arg === undefined ? `(${fn.toString()})()` : `(${fn.toString()})(${JSON.stringify(arg)})`;
-    const res = await this.sendCdp(tabId, "Runtime.evaluate", {
-      expression: expr,
-      returnByValue: true,
-      awaitPromise: true,
-    });
+    const params = { expression: expr, returnByValue: true, awaitPromise: true };
+    const contextId = await this.isolatedContext(tabId);
+    if (contextId != null) params.contextId = contextId;
+    const res = await this.sendCdp(tabId, "Runtime.evaluate", params);
     if (res && res.exceptionDetails) {
       throw new ToolError("eval_failed", res.exceptionDetails.text || "page evaluation failed");
     }
@@ -369,7 +503,11 @@ export class Executor {
       });
     });
     await this.sendCdp(chromeTabId, "Page.enable", {});
-    await this.sendCdp(chromeTabId, "Runtime.enable", {});
+    // NO `Runtime.enable`. It is the best-known CDP tell there is: with it on, Chrome serializes
+    // whatever a page logs to the console for the debugger, and a page that logs an object with a
+    // getter (an Error's `stack`, say) sees that getter run when nobody opened DevTools. Nothing
+    // here needs its events — `evalFn` asks for its context directly (`isolatedContext`).
+    this.frames.delete(chromeTabId);
     // AWAITED, and re-run on every re-attach: whatever a transport arms here is per-target and dies
     // with the session, so a tab the human detached from the DevTools infobar comes back unarmed
     // unless this runs again. A failure here fails the attach rather than proceeding unprotected.
@@ -546,36 +684,111 @@ export class Executor {
     return text(tree || "(empty page)");
   }
 
-  async click(tabId, ref, element) {
-    if (!ref) throw new ToolError("bad_args", "ref is required");
-    const box = await this.evalFn(tabId, RESOLVE_BOX_FN, ref);
+  /**
+   * Find a ref's box and bring it on screen the way a person would: wheel ticks under the pointer,
+   * paced, re-measuring as it goes. Only when the wheel makes no progress (the element lives in a
+   * scroller the pointer is not over) does it fall back to `scrollIntoView`.
+   */
+  async locate(tabId, ref) {
+    let box = await this.evalFn(tabId, BOX_FN, ref);
     if (!box || !box.found) {
       throw new ToolError("ref_expired", `ref ${ref} not found — re-run browser_snapshot and use a fresh ref`);
     }
-    const { x, y } = box;
-    await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    let stuck = 0;
+    for (let tick = 0; tick < MAX_WHEEL_TICKS && !onScreen(box); tick++) {
+      const at = this.cursors.get(tabId) || {
+        x: box.vw * rand(0.35, 0.65),
+        y: box.vh * rand(0.35, 0.65),
+      };
+      const wantY = box.top + Math.min(box.h, box.vh) / 2 - box.vh / 2; // >0: element is below
+      const wantX = box.w > box.vw || (box.left >= 0 && box.left + box.w <= box.vw)
+        ? 0
+        : box.left + box.w / 2 - box.vw / 2;
+      const deltaY = Math.abs(wantY) < 1 ? 0 : Math.sign(wantY) * Math.min(WHEEL_TICK, Math.abs(wantY) + 40);
+      const deltaX = Math.abs(wantX) < 1 ? 0 : Math.sign(wantX) * Math.min(WHEEL_TICK, Math.abs(wantX) + 40);
+      await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x: at.x, y: at.y, deltaX, deltaY });
+      this.cursors.set(tabId, at);
+      // A burst of notches, then the odd pause — a flick of the wheel, not a metronome.
+      await sleep(Math.random() < 0.15 ? rand(150, 350) : rand(25, 70));
+      const next = await this.evalFn(tabId, BOX_FN, ref);
+      if (!next || !next.found) break;
+      stuck = Math.abs(next.top - box.top) < 1 && Math.abs(next.left - box.left) < 1 ? stuck + 1 : 0;
+      box = next;
+      if (stuck >= 2) break;
+    }
+    if (!onScreen(box)) {
+      const jumped = await this.evalFn(tabId, RESOLVE_BOX_FN, ref);
+      if (!jumped || !jumped.found) {
+        throw new ToolError("ref_expired", `ref ${ref} not found — re-run browser_snapshot and use a fresh ref`);
+      }
+      box = (await this.evalFn(tabId, BOX_FN, ref)) || jumped;
+      await sleep(rand(80, 200));
+    }
+    return box;
+  }
+
+  /** Glide the pointer from wherever it last was to `to`. */
+  async moveMouse(tabId, to, box) {
+    let from = this.cursors.get(tabId);
+    if (!from) {
+      // First move in this tab: the pointer "enters" from somewhere plausible nearby.
+      const vw = (box && box.vw) || to.x * 2 || 800;
+      const vh = (box && box.vh) || to.y * 2 || 600;
+      from = { x: clamp(to.x + rand(-300, 300), 0, vw - 1), y: clamp(to.y + rand(-200, 200), 0, vh - 1) };
+    }
+    for (const p of mousePath(from, to)) {
+      await this.sendCdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, buttons: 0 });
+      await sleep(rand(6, 16));
+    }
+    this.cursors.set(tabId, to);
+  }
+
+  /** Move to a random point on the (on-screen) box, then a person-paced press and release. */
+  async humanClick(tabId, box) {
+    const p = aimPoint(box);
+    await this.moveMouse(tabId, p, box);
+    await sleep(rand(40, 140)); // settle before pressing
     await this.sendCdp(tabId, "Input.dispatchMouseEvent", {
       type: "mousePressed",
-      x,
-      y,
+      x: p.x,
+      y: p.y,
       button: "left",
+      buttons: 1,
       clickCount: 1,
     });
+    await sleep(rand(50, 130)); // a finger, not a relay
     await this.sendCdp(tabId, "Input.dispatchMouseEvent", {
       type: "mouseReleased",
-      x,
-      y,
+      x: p.x,
+      y: p.y,
       button: "left",
+      buttons: 0,
       clickCount: 1,
     });
+  }
+
+  async click(tabId, ref, element) {
+    if (!ref) throw new ToolError("bad_args", "ref is required");
+    const box = await this.locate(tabId, ref);
+    await this.humanClick(tabId, box);
     return text(`Clicked ${element || ref}`);
   }
 
   async type(tabId, ref, value, submit, slowly, append) {
     if (!ref) throw new ToolError("bad_args", "ref is required");
-    const focused = await this.evalFn(tabId, FOCUS_FN, ref);
-    if (!focused || !focused.found) {
-      throw new ToolError("ref_expired", `ref ${ref} not found — re-run browser_snapshot and use a fresh ref`);
+    // A person focuses a field by CLICKING it, so do that; `el.focus()` from script is the fallback
+    // for a field something else covers, or one with no box to click.
+    const box = await this.locate(tabId, ref);
+    let focused = false;
+    if (box.w > 0 && box.h > 0) {
+      await this.humanClick(tabId, box);
+      focused = await this.evalFn(tabId, IS_FOCUSED_FN, ref).catch(() => false);
+    }
+    if (!focused) {
+      const f = await this.evalFn(tabId, FOCUS_FN, ref);
+      if (!f || !f.found) {
+        throw new ToolError("ref_expired", `ref ${ref} not found — re-run browser_snapshot and use a fresh ref`);
+      }
     }
     if (!append) {
       const sel = await this.evalFn(tabId, SELECT_ALL_FN, ref);
@@ -726,6 +939,7 @@ export class Executor {
     } catch (e) {}
     await chrome.tabs.remove(rec.chromeTabId).catch(() => {});
     this.tabLocks.delete(rec.chromeTabId);
+    this.forgetTab(rec.chromeTabId);
     this.unregisterTab(session, handle);
     return text(`Closed tab ${handle}`);
   }
@@ -750,6 +964,7 @@ export class Executor {
       } catch (e) {}
       await chrome.tabs.remove(rec.chromeTabId).catch(() => {});
       this.tabLocks.delete(rec.chromeTabId);
+      this.forgetTab(rec.chromeTabId);
       this.tabIndex.delete(rec.chromeTabId);
       session.tabs.delete(handle);
     }
