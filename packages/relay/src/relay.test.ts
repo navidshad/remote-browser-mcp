@@ -428,6 +428,68 @@ describe("sessions", () => {
     assert.deepEqual(configs[0]!.blockedOrigins, ["https://a.example", "https://b.example"]);
   });
 
+  it("carries the allow list with the session, and pushes an edit to it", async () => {
+    // A run that may only load the sites its caller named. The relay holds no policy — it only has
+    // to deliver the list, at open time and when it changes, with the blocklist beside it.
+    const ext = new FakeExtension();
+    await ext.connectOk(ticketFor("uid_a", "brw_a"));
+    const base = {
+      ownerId: "uid_a",
+      browserId: "brw_a",
+      name: "browser_act",
+      args: {},
+      sessionId: "job_allow",
+      blockedOrigins: ["https://bank.example"],
+    };
+    await control("/v1/dispatch", { method: "POST", body: { ...base, allowedOrigins: ["vinted.com"] } });
+    await control("/v1/dispatch", { method: "POST", body: { ...base, allowedOrigins: ["vinted.com"] } });
+
+    const opens = ext.frames("session_open");
+    assert.equal(opens.length, 1);
+    assert.deepEqual(opens[0]!.allowedOrigins, ["vinted.com"]);
+    assert.deepEqual(opens[0]!.blockedOrigins, ["https://bank.example"]);
+    assert.equal(ext.frames("session_config").length, 0, "an unchanged list is not pushed again");
+
+    await control("/v1/dispatch", {
+      method: "POST",
+      body: { ...base, allowedOrigins: ["vinted.com", "example.org"] },
+    });
+    const configs = ext.frames("session_config");
+    assert.equal(configs.length, 1);
+    assert.deepEqual(configs[0]!.allowedOrigins, ["vinted.com", "example.org"]);
+    assert.deepEqual(
+      configs[0]!.blockedOrigins,
+      ["https://bank.example"],
+      "a push carries BOTH lists, so the extension never merges a partial one",
+    );
+
+    // Absent leaves it as it was; [] is a real change back to "any site".
+    await control("/v1/dispatch", { method: "POST", body: base });
+    assert.equal(ext.frames("session_config").length, 1, "a dispatch that sends no allow list changes nothing");
+    await control("/v1/dispatch", { method: "POST", body: { ...base, allowedOrigins: [] } });
+    const cleared = ext.frames("session_config");
+    assert.equal(cleared.length, 2);
+    assert.deepEqual(cleared[1]!.allowedOrigins, []);
+  });
+
+  it("a session opened with no allow list announces an empty one", async () => {
+    const ext = new FakeExtension();
+    await ext.connectOk(ticketFor("uid_a2", "brw_a2"));
+    await control("/v1/dispatch", {
+      method: "POST",
+      body: { ownerId: "uid_a2", browserId: "brw_a2", name: "browser_open", args: {}, sessionId: "job_any" },
+    });
+    assert.deepEqual(ext.frames("session_open")[0]!.allowedOrigins, []);
+  });
+
+  it("refuses an allow list that is not a list of strings", async () => {
+    const res = await control("/v1/dispatch", {
+      method: "POST",
+      body: { ownerId: "uid_x", browserId: "brw_x", name: "browser_open", args: {}, allowedOrigins: "vinted.com" },
+    });
+    assert.equal(res.status, 400);
+  });
+
   it("closing a session that is not here reports success, not an error", async () => {
     // The tabs we were asked to close went with the browser. Making Crew handle a failure for
     // "already gone" would mean retrying a teardown that can never be needed.
@@ -469,6 +531,7 @@ describe("supersede", () => {
     assert.equal(reopened.length, 1);
     assert.equal(reopened[0]!.sessionId, "job_live");
     assert.deepEqual(reopened[0]!.blockedOrigins, ["https://x.example"]);
+    assert.deepEqual(reopened[0]!.allowedOrigins, [], "and its allow list rides the re-announce too");
   });
 
   it("settles an in-flight command immediately instead of making the caller wait out its timeout", async () => {

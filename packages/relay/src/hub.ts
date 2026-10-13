@@ -90,6 +90,8 @@ export interface DispatchInput {
   sessionId?: string;
   /** The caller's blocklist. Applied when the session is opened, and pushed live if it changed. */
   blockedOrigins?: string[];
+  /** The caller's allow list, the same way. Absent or empty means any site but the blocklist. */
+  allowedOrigins?: string[];
 }
 
 interface Pending {
@@ -100,6 +102,7 @@ interface Pending {
 interface SessionState {
   lastActivityAt: number;
   blockedOrigins: string[];
+  allowedOrigins: string[];
 }
 
 interface BrowserConn {
@@ -296,7 +299,12 @@ export class BrowserHub {
     });
     // Re-announce what we believe is open, so a reconnecting extension rebuilds its tab groups.
     for (const [sid, state] of conn.openSessions) {
-      this.send(ws, { t: "session_open", sessionId: sid, blockedOrigins: state.blockedOrigins });
+      this.send(ws, {
+        t: "session_open",
+        sessionId: sid,
+        blockedOrigins: state.blockedOrigins,
+        allowedOrigins: state.allowedOrigins,
+      });
     }
 
     conn.pingTimer = setInterval(() => {
@@ -422,7 +430,9 @@ export class BrowserHub {
       return Promise.resolve({ outcome: "busy", pending: conn.pending.size });
     }
 
-    if (input.sessionId) this.ensureSession(conn, input.sessionId, input.blockedOrigins);
+    if (input.sessionId) {
+      this.ensureSession(conn, input.sessionId, input.blockedOrigins, input.allowedOrigins);
+    }
 
     const id = randomUUID();
     return new Promise<DispatchOutcome>((resolve) => {
@@ -452,26 +462,51 @@ export class BrowserHub {
   }
 
   /**
-   * Open the session if it is new; push the blocklist if it changed under a live one.
+   * Open the session if it is new; push the blocklist or the allow list if either changed under a
+   * live one. A push always carries BOTH lists, so the extension never has to merge a partial one.
    *
    * The live push is what makes Ship settings an actual control rather than a note. A captain
    * blocking an origin during an incident needs it to apply to the run that is already going —
    * the run they are worried about — and a session that only reads its blocklist at open time
    * would ignore them until the job ended.
    */
-  private ensureSession(conn: BrowserConn, sessionId: string, blockedOrigins?: string[]): void {
-    const next = blockedOrigins ?? [];
+  private ensureSession(
+    conn: BrowserConn,
+    sessionId: string,
+    blockedOrigins?: string[],
+    allowedOrigins?: string[],
+  ): void {
     const existing = conn.openSessions.get(sessionId);
     if (!existing) {
-      conn.openSessions.set(sessionId, { lastActivityAt: Date.now(), blockedOrigins: next });
-      this.send(conn.socket, { t: "session_open", sessionId, blockedOrigins: next });
+      const state = {
+        lastActivityAt: Date.now(),
+        blockedOrigins: blockedOrigins ?? [],
+        allowedOrigins: allowedOrigins ?? [],
+      };
+      conn.openSessions.set(sessionId, state);
+      this.send(conn.socket, {
+        t: "session_open",
+        sessionId,
+        blockedOrigins: state.blockedOrigins,
+        allowedOrigins: state.allowedOrigins,
+      });
       return;
     }
     existing.lastActivityAt = Date.now();
-    if (blockedOrigins !== undefined && !sameOrigins(existing.blockedOrigins, next)) {
-      existing.blockedOrigins = next;
-      this.send(conn.socket, { t: "session_config", sessionId, blockedOrigins: next });
-    }
+    // A list the caller did not send is left as it was; only one it sent can change.
+    const blockedChanged =
+      blockedOrigins !== undefined && !sameOrigins(existing.blockedOrigins, blockedOrigins);
+    const allowedChanged =
+      allowedOrigins !== undefined && !sameOrigins(existing.allowedOrigins, allowedOrigins);
+    if (!blockedChanged && !allowedChanged) return;
+    if (blockedChanged) existing.blockedOrigins = blockedOrigins!;
+    if (allowedChanged) existing.allowedOrigins = allowedOrigins!;
+    this.send(conn.socket, {
+      t: "session_config",
+      sessionId,
+      blockedOrigins: existing.blockedOrigins,
+      allowedOrigins: existing.allowedOrigins,
+    });
   }
 
   /** Tell a browser an agent's run ended so it tears down that run's tabs. */

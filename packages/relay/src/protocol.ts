@@ -124,6 +124,12 @@ export interface SessionOpenMsg {
   sessionId: string;
   /** Level 1 of the two-level blocklist. The extension UNIONS this with its own; see README. */
   blockedOrigins?: string[];
+  /**
+   * The only sites this run may load. Absent or empty means any site except the blocklist, and the
+   * blocklist wins over it. How an entry matches is the extension's business — the relay only
+   * carries it.
+   */
+  allowedOrigins?: string[];
 }
 
 /** A live update to an already-open session's configuration. */
@@ -131,6 +137,7 @@ export interface SessionConfigMsg {
   t: "session_config";
   sessionId: string;
   blockedOrigins?: string[];
+  allowedOrigins?: string[];
 }
 
 /** An agent's run ended; tear down its tabs. */

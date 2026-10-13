@@ -39,6 +39,7 @@ const dispatchSchema = z.object({
   timeoutMs: z.number().int().default(20_000),
   sessionId: idField.optional(),
   blockedOrigins: z.array(z.string().max(500)).max(500).optional(),
+  allowedOrigins: z.array(z.string().max(500)).max(500).optional(),
 });
 
 const sessionCloseSchema = z.object({
